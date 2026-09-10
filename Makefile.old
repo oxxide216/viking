@@ -1,0 +1,54 @@
+.RECIPEPREFIX = >
+
+PLATFORM = LINUX
+
+ifeq ($(PLATFORM), LINUX)
+  CC = cc
+else ifeq ($(PLATFORM), WINDOWS)
+  CC = x86_64-w64-mingw32-gcc
+endif
+override CFLAGS += -Wall -Wextra -Iinclude -Ilibs -Ilibs/winx/include -Ilibs/glad/include
+ifeq ($(PLATFORM), LINUX)
+  override LDFLAGS += -z execstack -L. -Llibs/winx \
+                      -l:libwinx.a -l:libviking.a -lX11 -lXext -lXrandr
+else ifeq ($(PLATFORM), WINDOWS)
+  override LDFLAGS += -L. -Llibs/winx -l:libwinx.lib \
+                      -l:libviking.lib \
+                      -static
+endif
+BUILD_DIR = build
+
+SRC = $(wildcard src/*.c)
+
+ifeq ($(PLATFORM), LINUX)
+  OBJ = $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRC))
+else ifeq ($(PLATFORM), WINDOWS)
+  OBJ = $(patsubst src/%.c,$(BUILD_DIR)/%.obj,$(SRC))
+endif
+
+ifeq ($(PLATFORM), LINUX)
+libviking.a: $(OBJ)
+> ar rcs libviking.a $(OBJ)
+else ifeq ($(PLATFORM), WINDOWS)
+libviking.lib: $(OBJ)
+> x86_64-w64-mingw32-ar rcs libviking.lib $(OBJ)
+endif
+
+tests: $(TESTS_EXECS)
+
+$(BUILD_DIR)/%.o: src/%.c
+> mkdir -p $(dir $@)
+> $(CC) $(CFLAGS) -c -o $@ $<
+
+$(BUILD_DIR)/%.obj: src/%.c
+> mkdir -p $(dir $@)
+> $(CC) $(CFLAGS) -c -o $@ $<
+
+libs/winx/libwinx.a:
+> $(MAKE) -C libs/winx
+
+libs/winx/libwinx.lib:
+> $(MAKE) -C libs/winx PLATFORM=WINDOWS
+
+clean:
+> rm -rf $(BUILD_DIR) libviking.a libviking.lib

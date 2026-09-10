@@ -1,0 +1,6 @@
+[submodule "libs/winx"]
+	path = libs/winx
+	url = https://github.com/oxxide216/winx
+[submodule "libs/shl"]
+	path = libs/shl
+	url = https://github.com/oxxide216/shl
