@@ -45,7 +45,9 @@ int main(void) {
   VikShader *shader = vik_make_shader_vf(instance, vertex_bc, fragment_bc);
   VikUBO *ubo = vik_make_ubo(instance, sizeof(UniformBufferObject));
   vik_update_ubo(ubo, &uniform);
-  VikPipeline *pipeline = vik_make_pipeline(instance, shader, attrs, ARRAY_LEN(attrs), ubo);
+  VikPipeline *pipeline = vik_make_pipeline(instance, shader,
+                                            attrs, ARRAY_LEN(attrs),
+                                            &ubo, 1);
   vik_delete_shader(shader);
   VikExecutor *executor = vik_make_executor(instance);
   VikMesh *mesh = vik_make_mesh(instance,

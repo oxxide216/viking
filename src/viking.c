@@ -29,7 +29,6 @@ struct VikInstance {
   VkSemaphore                  *render_finished_semaphores;
   VkFence                       in_flight_fence;
   VkCommandPool                 temp_pool;
-  VkDescriptorPool              descriptor_pool;
   u32                           image_index;
 };
 
@@ -50,12 +49,13 @@ struct VikUBO {
 struct VikPipeline {
   VikInstance           *instance;
   VkFramebuffer         *framebuffers;
+  VkDescriptorPool       descriptor_pool;
   VkDescriptorSetLayout  descriptor_set_layout;
   VkDescriptorSet        descriptor_set;
   VkPipelineLayout       layout;
   VkRenderPass           render_pass;
   VkPipeline             pipeline;
-  VikUBO                *ubo;
+  bool                   has_ubos;
 };
 
 struct VikExecutor {
@@ -538,26 +538,6 @@ VikInstance *vik_make_instance(WinxWindow *window) {
     return NULL;
   }
 
-  VkDescriptorPoolSize descriptor_pool_size = {0};
-  descriptor_pool_size.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-  descriptor_pool_size.descriptorCount = 1;
-
-  VkDescriptorPoolCreateInfo descriptor_pool_create_info = {0};
-  descriptor_pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  descriptor_pool_create_info.poolSizeCount = 1;
-  descriptor_pool_create_info.pPoolSizes = &descriptor_pool_size;
-  descriptor_pool_create_info.maxSets = 1;
-
-  VkDescriptorPool descriptor_pool;
-  VkResult descriptor_pool_result =
-    vkCreateDescriptorPool(device, &descriptor_pool_create_info,
-                           NULL, &descriptor_pool);
-  if (descriptor_pool_result != VK_SUCCESS) {
-    sprintf(error_buffer, "Failed to create Vulkan descriptor pool: %s",
-            vk_result_to_cstr(descriptor_pool_result));
-    return NULL;
-  }
-
   VikInstance *result = malloc(sizeof(*result));
   result->window = window;
   result->instance = instance;
@@ -573,7 +553,6 @@ VikInstance *vik_make_instance(WinxWindow *window) {
   result->render_finished_semaphores = render_finished_semaphores;
   result->in_flight_fence = in_flight_fence;
   result->temp_pool = command_pool;
-  result->descriptor_pool = descriptor_pool;
   return result;
 }
 
@@ -753,7 +732,8 @@ VikUBO *vik_make_ubo(VikInstance *instance, u32 size) {
 }
 
 VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
-                               VikAttr *attrs, u32 attrs_len, VikUBO *ubo) {
+                               VikAttr *attrs, u32 attrs_len,
+                               VikUBO **ubos, u32 ubos_len) {
   VkPipelineShaderStageCreateInfo shader_stage_infos[2] = {0};
   shader_stage_infos[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
   shader_stage_infos[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -845,19 +825,43 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
   color_blending_create_info.attachmentCount = 1;
   color_blending_create_info.pAttachments = &color_blend_attachment;
 
-  VkDescriptorSetLayoutBinding layout_binding = {0};
-  layout_binding.binding = 0;
-  layout_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-  layout_binding.descriptorCount = 1;
-  layout_binding.stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
+  VkDescriptorPoolSize descriptor_pool_size = {0};
+  descriptor_pool_size.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  descriptor_pool_size.descriptorCount = ubos_len;
+
+  VkDescriptorPoolCreateInfo descriptor_pool_create_info = {0};
+  descriptor_pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  descriptor_pool_create_info.poolSizeCount = 1;
+  descriptor_pool_create_info.pPoolSizes = &descriptor_pool_size;
+  descriptor_pool_create_info.maxSets = 1;
+
+  VkDescriptorPool descriptor_pool;
+  VkResult descriptor_pool_result =
+    vkCreateDescriptorPool(instance->device, &descriptor_pool_create_info,
+                           NULL, &descriptor_pool);
+  if (descriptor_pool_result != VK_SUCCESS) {
+    sprintf(error_buffer, "Failed to create Vulkan descriptor pool: %s",
+            vk_result_to_cstr(descriptor_pool_result));
+    return NULL;
+  }
 
   VkDescriptorSetLayout descriptor_set_layout;
   VkDescriptorSet descriptor_set;
-  if (ubo) {
+  if (ubos_len > 0) {
+    VkDescriptorSetLayoutBinding *layout_bindings =
+      malloc(ubos_len * sizeof(*layout_bindings));
+
+    for (u32 i = 0; i < ubos_len; ++i) {
+      layout_bindings[i].binding = i;
+      layout_bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+      layout_bindings[i].descriptorCount = 1;
+      layout_bindings[i].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
+    }
+
     VkDescriptorSetLayoutCreateInfo layout_create_info = {0};
     layout_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layout_create_info.bindingCount = 1;
-    layout_create_info.pBindings = &layout_binding;
+    layout_create_info.bindingCount = ubos_len;
+    layout_create_info.pBindings = layout_bindings;
 
     VkResult descriptor_set_layout_result = vkCreateDescriptorSetLayout(instance->device, &layout_create_info, NULL, &descriptor_set_layout);
     if (descriptor_set_layout_result != VK_SUCCESS) {
@@ -866,9 +870,11 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
       return NULL;
     }
 
+    free(layout_bindings);
+
     VkDescriptorSetAllocateInfo descriptor_set_alloc_info = {0};
     descriptor_set_alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    descriptor_set_alloc_info.descriptorPool = instance->descriptor_pool;
+    descriptor_set_alloc_info.descriptorPool = descriptor_pool;
     descriptor_set_alloc_info.descriptorSetCount = 1;
     descriptor_set_alloc_info.pSetLayouts = &descriptor_set_layout;
 
@@ -880,10 +886,14 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
       return NULL;
     }
 
-    VkDescriptorBufferInfo descriptor_buffer_info = {0};
-    descriptor_buffer_info.buffer = ubo->buffer;
-    descriptor_buffer_info.offset = 0;
-    descriptor_buffer_info.range = ubo->size;
+    VkDescriptorBufferInfo *descriptor_buffer_infos =
+      malloc(ubos_len * sizeof(*descriptor_buffer_infos));
+
+    for (u32 i = 0; i < ubos_len; ++i) {
+      descriptor_buffer_infos[i].buffer = ubos[i]->buffer;
+      descriptor_buffer_infos[i].offset = 0;
+      descriptor_buffer_infos[i].range = ubos[i]->size;
+    }
 
     VkWriteDescriptorSet descriptor_set_write = {0};
     descriptor_set_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -891,15 +901,17 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
     descriptor_set_write.dstBinding = 0;
     descriptor_set_write.dstArrayElement = 0;
     descriptor_set_write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    descriptor_set_write.descriptorCount = 1;
-    descriptor_set_write.pBufferInfo = &descriptor_buffer_info;
+    descriptor_set_write.descriptorCount = ubos_len;
+    descriptor_set_write.pBufferInfo = descriptor_buffer_infos;
 
     vkUpdateDescriptorSets(instance->device, 1, &descriptor_set_write, 0, NULL);
+
+    free(descriptor_buffer_infos);
   }
 
   VkPipelineLayoutCreateInfo pipeline_layout_create_info = {0};
   pipeline_layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-  if (ubo) {
+  if (ubos_len > 0) {
     pipeline_layout_create_info.setLayoutCount = 1; // Optional
     pipeline_layout_create_info.pSetLayouts = &descriptor_set_layout; // Optional
   } else {
@@ -1000,12 +1012,13 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
   VikPipeline *result = malloc(sizeof(*result));
   result->instance = instance;
   result->framebuffers = framebuffers;
+  result->descriptor_pool = descriptor_pool;
   result->descriptor_set_layout = descriptor_set_layout;
   result->descriptor_set = descriptor_set;
   result->layout = pipeline_layout;
   result->render_pass = render_pass;
   result->pipeline = graphics_pipeline;
-  result->ubo = ubo;
+  result->has_ubos = ubos_len > 0;
   return result;
 }
 
@@ -1336,6 +1349,23 @@ void vik_cmd_use_pipeline(VikExecutor *executor, VikPipeline *pipeline) {
   vkCmdSetScissor(executor->buffer, 0, 1, &scissor);
 }
 
+void vik_cmd_wait(VikExecutor *executor) {
+  VkMemoryBarrier2 memory_barrier = {0};
+  memory_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+  memory_barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+  memory_barrier.srcAccessMask = 0;
+  memory_barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+  memory_barrier.dstAccessMask = 0;
+
+  VkDependencyInfo dependency_info = {0};
+  dependency_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+  dependency_info.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+  dependency_info.memoryBarrierCount = 1;
+  dependency_info.pMemoryBarriers = &memory_barrier;
+
+  vkCmdPipelineBarrier2(executor->buffer, &dependency_info);
+}
+
 void vik_cmd_draw(VikExecutor *executor, VikMesh *mesh, u32 instances_len) {
   VkDeviceSize offset = 0;
   vkCmdBindVertexBuffers(executor->buffer, 0, 1, &mesh->vertex_buffer, &offset);
@@ -1350,7 +1380,6 @@ void vik_update_ubo(VikUBO *ubo, void *data) {
 void vik_delete_instance(VikInstance *instance) {
   vkDeviceWaitIdle(instance->device);
 
-  vkDestroyDescriptorPool(instance->device, instance->descriptor_pool, NULL);
   vkDestroyCommandPool(instance->device, instance->temp_pool, NULL);
 
   vkDestroyFence(instance->device, instance->in_flight_fence, NULL);
@@ -1395,8 +1424,9 @@ void vik_delete_pipeline(VikPipeline *pipeline) {
   vkDestroyPipeline(pipeline->instance->device, pipeline->pipeline, NULL);
   vkDestroyRenderPass(pipeline->instance->device, pipeline->render_pass, NULL);
   vkDestroyPipelineLayout(pipeline->instance->device, pipeline->layout, NULL);
-  if (pipeline->ubo)
+  if (pipeline->has_ubos)
     vkDestroyDescriptorSetLayout(pipeline->instance->device, pipeline->descriptor_set_layout, NULL);
+  vkDestroyDescriptorPool(pipeline->instance->device, pipeline->descriptor_pool, NULL);
 
   free(pipeline->framebuffers);
   free(pipeline);

@@ -35,7 +35,8 @@ VikInstance *vik_make_instance(WinxWindow *window);
 VikShader   *vik_make_shader_vf(VikInstance *instance, Str vertex_bc, Str fragment_bc);
 VikUBO      *vik_make_ubo(VikInstance *instance, u32 size);
 VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
-                               VikAttr *attrs, u32 attrs_len, VikUBO *ubo);
+                               VikAttr *attrs, u32 attrs_len,
+                               VikUBO **ubos, u32 ubos_len);
 VikExecutor *vik_make_executor(VikInstance *instance);
 VikMesh     *vik_make_mesh_sized(VikInstance *instance, void *data,
                                  u32 len, u32 vertex_size,
@@ -46,6 +47,7 @@ bool vik_begin_frame(VikExecutor *executor, VikPipeline *pipeline,
 bool vik_end_frame(VikExecutor *executor, VikPipeline *pipeline);
 
 void vik_cmd_use_pipeline(VikExecutor *executor, VikPipeline *pipeline);
+void vik_cmd_wait(VikExecutor *executor);
 void vik_cmd_draw(VikExecutor *executor, VikMesh *mesh, u32 instances_len);
 
 void vik_update_ubo(VikUBO *ubo, void *data);
