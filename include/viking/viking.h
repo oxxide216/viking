@@ -85,9 +85,8 @@ VikImage    *vik_make_image_ex(VikInstance *instance, void *data,
                                VikImageFormat format,
                                VikImageFilter filter);
 
-bool vik_begin_frame(VikExecutor *executor, VikPipeline *pipeline,
-                     f32 r, f32 g, f32 b, f32 a);
-bool vik_end_frame(VikExecutor *executor, VikPipeline *pipeline);
+bool vik_begin_frame(VikExecutor *executor, f32 r, f32 g, f32 b, f32 a);
+bool vik_end_frame(VikExecutor *executor);
 bool vik_begin_compute_frame(VikExecutor *executor);
 bool vik_end_compute_frame(VikExecutor *executor);
 

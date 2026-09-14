@@ -14,6 +14,8 @@ typedef struct {
   VkImageView        *image_views;
 } WindowSizeDependantResources;
 
+typedef Da(VikPipeline *) VikPipelines;
+
 struct VikInstance {
   WinxWindow                   *window;
   VkInstance                    instance;
@@ -31,6 +33,7 @@ struct VikInstance {
   VkSemaphore                   compute_finished_semaphore;
   VkFence                       in_flight_fence;
   VkCommandPool                 temp_pool;
+  VikPipelines                  graphics_pipelines;
   u32                           image_index;
   bool                          has_compute;
 };
@@ -599,6 +602,7 @@ VikInstance *vik_make_instance(WinxWindow *window, VikRequestFlags request) {
   result->render_finished_semaphores = render_finished_semaphores;
   result->in_flight_fence = in_flight_fence;
   result->temp_pool = command_pool;
+  result->graphics_pipelines = (VikPipelines) {0};
   result->has_compute = false;
   return result;
 }
@@ -1414,6 +1418,9 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
   result->has_descriptor_set_layout = has_descriptor_set_layout;
   result->is_compute = is_compute;
 
+  if (!is_compute)
+    DA_APPEND(instance->graphics_pipelines, result);
+
   return result;
 }
 
@@ -1808,8 +1815,7 @@ VikImage *vik_make_image_ex(VikInstance *instance, void *data,
   return result;
 }
 
-bool vik_begin_frame(VikExecutor *executor, VikPipeline *pipeline,
-                     f32 r, f32 g, f32 b, f32 a) {
+bool vik_begin_frame(VikExecutor *executor, f32 r, f32 g, f32 b, f32 a) {
   VikInstance *instance = executor->instance;
 
   vkWaitForFences(instance->device, 1, &instance->in_flight_fence, VK_TRUE, UINT64_MAX);
@@ -1822,44 +1828,48 @@ bool vik_begin_frame(VikExecutor *executor, VikPipeline *pipeline,
   if (acquire_result == VK_ERROR_OUT_OF_DATE_KHR || acquire_result == VK_SUBOPTIMAL_KHR) {
     vkDeviceWaitIdle(instance->device);
 
-    vkDestroyImageView(instance->device, pipeline->depth_image_view, NULL);
-    vkDestroyImage(instance->device, pipeline->depth_image, NULL);
-    vkFreeMemory(instance->device, pipeline->depth_image_memory, NULL);
+    for (u32 i = 0; i < instance->graphics_pipelines.len; ++i) {
+      VikPipeline *pipeline = instance->graphics_pipelines.items[i];
 
-    for (u32 i = 0; i < instance->resources.images_len; ++i)
-      vkDestroyFramebuffer(instance->device, pipeline->framebuffers[i], NULL);
+      vkDestroyImageView(instance->device, pipeline->depth_image_view, NULL);
+      vkDestroyImage(instance->device, pipeline->depth_image, NULL);
+      vkFreeMemory(instance->device, pipeline->depth_image_memory, NULL);
 
-    free(pipeline->framebuffers);
+      for (u32 i = 0; i < instance->resources.images_len; ++i)
+        vkDestroyFramebuffer(instance->device, pipeline->framebuffers[i], NULL);
 
-    delete_window_size_dependant_resources(&instance->resources, instance->device);
+      free(pipeline->framebuffers);
 
-    bool ok;
+      delete_window_size_dependant_resources(&instance->resources, instance->device);
 
-    ok = make_window_size_dependant_resources_except_framebuffers(&instance->resources,
-                                                                  instance->physical_device,
-                                                                  instance->device,
-                                                                  instance->surface,
-                                                                  instance->graphics_queue_family_index,
-                                                                  instance->present_queue_family_index,
-                                                                  instance->window->width,
-                                                                  instance->window->height);
-    if (!ok)
-      return false;
+      bool ok;
 
-    ok = make_depth_image_and_view(instance->physical_device, instance->device,
-                                   instance->resources.extent, &pipeline->depth_image,
-                                   &pipeline->depth_image_memory,
-                                   &pipeline->depth_image_view);
-    if (!ok)
-      return false;
+      ok = make_window_size_dependant_resources_except_framebuffers(&instance->resources,
+                                                                    instance->physical_device,
+                                                                    instance->device,
+                                                                    instance->surface,
+                                                                    instance->graphics_queue_family_index,
+                                                                    instance->present_queue_family_index,
+                                                                    instance->window->width,
+                                                                    instance->window->height);
+      if (!ok)
+        return false;
 
-    pipeline->framebuffers =
-      malloc(instance->resources.images_len * sizeof(*pipeline->framebuffers));
-    ok = make_framebuffers(pipeline->framebuffers, &instance->resources,
-                           instance->device, pipeline->render_pass,
-                           pipeline->depth_image_view);
-    if (!ok)
-      return false;
+      ok = make_depth_image_and_view(instance->physical_device, instance->device,
+                                     instance->resources.extent, &pipeline->depth_image,
+                                     &pipeline->depth_image_memory,
+                                     &pipeline->depth_image_view);
+      if (!ok)
+        return false;
+
+      pipeline->framebuffers =
+        malloc(instance->resources.images_len * sizeof(*pipeline->framebuffers));
+      ok = make_framebuffers(pipeline->framebuffers, &instance->resources,
+                             instance->device, pipeline->render_pass,
+                             pipeline->depth_image_view);
+      if (!ok)
+        return false;
+    }
 
     sprintf(error_buffer, "Resized");
     return false;
@@ -1885,21 +1895,25 @@ bool vik_begin_frame(VikExecutor *executor, VikPipeline *pipeline,
   clear_values[0].color = (VkClearColorValue) { { r, g, b, a } };
   clear_values[1].depthStencil = (VkClearDepthStencilValue) { 1.0, 0.0 };
 
-  VkRenderPassBeginInfo render_pass_begin_info = {0};
-  render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-  render_pass_begin_info.renderPass = pipeline->render_pass;
-  render_pass_begin_info.framebuffer = pipeline->framebuffers[instance->image_index];
-  render_pass_begin_info.renderArea.offset = (VkOffset2D) { 0, 0 };
-  render_pass_begin_info.renderArea.extent = instance->resources.extent;
-  render_pass_begin_info.clearValueCount = ARRAY_LEN(clear_values);
-  render_pass_begin_info.pClearValues = clear_values;
+  for (u32 i = 0; i < instance->graphics_pipelines.len; ++i) {
+    VikPipeline *pipeline = instance->graphics_pipelines.items[i];
 
-  vkCmdBeginRenderPass(executor->buffer, &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
+    VkRenderPassBeginInfo render_pass_begin_info = {0};
+    render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    render_pass_begin_info.renderPass = pipeline->render_pass;
+    render_pass_begin_info.framebuffer = pipeline->framebuffers[instance->image_index];
+    render_pass_begin_info.renderArea.offset = (VkOffset2D) { 0, 0 };
+    render_pass_begin_info.renderArea.extent = instance->resources.extent;
+    render_pass_begin_info.clearValueCount = ARRAY_LEN(clear_values);
+    render_pass_begin_info.pClearValues = clear_values;
+
+    vkCmdBeginRenderPass(executor->buffer, &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
+  }
 
   return true;
 }
 
-bool vik_end_frame(VikExecutor *executor, VikPipeline *pipeline) {
+bool vik_end_frame(VikExecutor *executor) {
   VikInstance *instance = executor->instance;
 
   vkCmdEndRenderPass(executor->buffer);
@@ -1948,44 +1962,48 @@ bool vik_end_frame(VikExecutor *executor, VikPipeline *pipeline) {
   if (draw_result == VK_ERROR_OUT_OF_DATE_KHR || draw_result == VK_SUBOPTIMAL_KHR) {
     vkDeviceWaitIdle(instance->device);
 
-    vkDestroyImageView(instance->device, pipeline->depth_image_view, NULL);
-    vkDestroyImage(instance->device, pipeline->depth_image, NULL);
-    vkFreeMemory(instance->device, pipeline->depth_image_memory, NULL);
+    for (u32 i = 0; i < instance->graphics_pipelines.len; ++i) {
+      VikPipeline *pipeline = instance->graphics_pipelines.items[i];
 
-    for (u32 i = 0; i < instance->resources.images_len; ++i)
-      vkDestroyFramebuffer(instance->device, pipeline->framebuffers[i], NULL);
+      vkDestroyImageView(instance->device, pipeline->depth_image_view, NULL);
+      vkDestroyImage(instance->device, pipeline->depth_image, NULL);
+      vkFreeMemory(instance->device, pipeline->depth_image_memory, NULL);
 
-    free(pipeline->framebuffers);
+      for (u32 i = 0; i < instance->resources.images_len; ++i)
+        vkDestroyFramebuffer(instance->device, pipeline->framebuffers[i], NULL);
 
-    delete_window_size_dependant_resources(&instance->resources, instance->device);
+      free(pipeline->framebuffers);
 
-    bool ok;
+      delete_window_size_dependant_resources(&instance->resources, instance->device);
 
-    ok = make_window_size_dependant_resources_except_framebuffers(&instance->resources,
-                                                                  instance->physical_device,
-                                                                  instance->device,
-                                                                  instance->surface,
-                                                                  instance->graphics_queue_family_index,
-                                                                  instance->present_queue_family_index,
-                                                                  instance->window->width,
-                                                                  instance->window->height);
-    if (!ok)
-      return false;
+      bool ok;
 
-    ok = make_depth_image_and_view(instance->physical_device, instance->device,
-                                   instance->resources.extent, &pipeline->depth_image,
-                                   &pipeline->depth_image_memory,
-                                   &pipeline->depth_image_view);
-    if (!ok)
-      return false;
+      ok = make_window_size_dependant_resources_except_framebuffers(&instance->resources,
+                                                                    instance->physical_device,
+                                                                    instance->device,
+                                                                    instance->surface,
+                                                                    instance->graphics_queue_family_index,
+                                                                    instance->present_queue_family_index,
+                                                                    instance->window->width,
+                                                                    instance->window->height);
+      if (!ok)
+        return false;
 
-    pipeline->framebuffers =
-      malloc(instance->resources.images_len * sizeof(*pipeline->framebuffers));
-    ok = make_framebuffers(pipeline->framebuffers, &instance->resources,
-                           instance->device, pipeline->render_pass,
-                           pipeline->depth_image_view);
-    if (!ok)
-      return false;
+      ok = make_depth_image_and_view(instance->physical_device, instance->device,
+                                     instance->resources.extent, &pipeline->depth_image,
+                                     &pipeline->depth_image_memory,
+                                     &pipeline->depth_image_view);
+      if (!ok)
+        return false;
+
+      pipeline->framebuffers =
+        malloc(instance->resources.images_len * sizeof(*pipeline->framebuffers));
+      ok = make_framebuffers(pipeline->framebuffers, &instance->resources,
+                             instance->device, pipeline->render_pass,
+                             pipeline->depth_image_view);
+      if (!ok)
+        return false;
+    }
   } else if (draw_result != VK_SUCCESS) {
     sprintf(error_buffer, "Failed to draw: %s", vk_result_to_cstr(draw_result));
     return false;
@@ -2104,6 +2122,8 @@ void vik_delete_instance(VikInstance *instance) {
   vkDestroySurfaceKHR(instance->instance, instance->surface, NULL);
   vkDestroyInstance(instance->instance, NULL);
 
+  if (instance->graphics_pipelines.items)
+    free(instance->graphics_pipelines.items);
   free(instance);
 }
 

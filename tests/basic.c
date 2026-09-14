@@ -90,13 +90,13 @@ int main(void) {
         break;
     }
 
-    if (!vik_begin_frame(executor, pipeline, 0.0, 0.0, 0.0, 1.0)) {
+    if (!vik_begin_frame(executor, 0.0, 0.0, 0.0, 1.0)) {
       winx_draw(window);
       continue;
     }
     vik_cmd_use_pipeline(executor, pipeline);
     vik_cmd_draw(executor, mesh, 1);
-    vik_end_frame(executor, pipeline);
+    vik_end_frame(executor);
 
     winx_draw(window);
   }
