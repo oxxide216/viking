@@ -24,18 +24,30 @@ struct VikInstance {
   VkDevice                      device;
   VkQueue                       graphics_queue;
   VkQueue                       present_queue;
+  VkQueue                       compute_queue;
   WindowSizeDependantResources  resources;
   VkSemaphore                   image_available_semaphore;
   VkSemaphore                  *render_finished_semaphores;
+  VkSemaphore                   compute_finished_semaphore;
   VkFence                       in_flight_fence;
   VkCommandPool                 temp_pool;
   u32                           image_index;
+  bool                          has_compute;
 };
+
+typedef enum {
+  VikShaderKindVF = 0,
+  VikShaderKindVGF,
+  VikShaderKindC,
+} VikShaderKind;
 
 struct VikShader {
   VikInstance    *instance;
   VkShaderModule  vertex_module;
+  VkShaderModule  geometry_module;
   VkShaderModule  fragment_module;
+  VkShaderModule  compute_module;
+  VikShaderKind   kind;
 };
 
 struct VikBuffer {
@@ -60,6 +72,7 @@ struct VikPipeline {
   VkRenderPass           render_pass;
   VkPipeline             pipeline;
   bool                   has_descriptor_set_layout;
+  bool                   is_compute;
 };
 
 struct VikExecutor {
@@ -311,7 +324,7 @@ static void delete_window_size_dependant_resources(WindowSizeDependantResources 
   vkDestroySwapchainKHR(device, resources->swap_chain, NULL);
 }
 
-VikInstance *vik_make_instance(WinxWindow *window) {
+VikInstance *vik_make_instance(WinxWindow *window, VikRequestFlags request) {
   VkApplicationInfo app_info = {0};
   app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
   app_info.pApplicationName = APP_NAME;
@@ -389,7 +402,9 @@ VikInstance *vik_make_instance(WinxWindow *window) {
       vkGetPhysicalDeviceQueueFamilyProperties(physical_devices[j], &queue_family_props_len, queue_family_props);
 
       for (u32 k = 0; k < queue_family_props_len; ++k) {
-        if (queue_family_props[k].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+        if ((queue_family_props[k].queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
+            (((request & VikRequestFlagsCompute) == 0) ||
+             (queue_family_props[k].queueFlags & VK_QUEUE_COMPUTE_BIT))) {
           graphics_queue_family_index = k;
           if (present_queue_family_index != (u32) -1)
             break;
@@ -430,7 +445,9 @@ VikInstance *vik_make_instance(WinxWindow *window) {
           present_queue_family_index != (u32) -1 &&
           found_swapchain_device_extension &&
           device_features.samplerAnisotropy &&
-          device_features.vertexPipelineStoresAndAtomics) {
+          device_features.vertexPipelineStoresAndAtomics &&
+          ((request & VikRequestFlagsGeometry) == 0 ||
+           device_features.geometryShader)) {
         physical_device = physical_devices[j];
         found_suitable_physical_device = true;
       }
@@ -478,6 +495,8 @@ VikInstance *vik_make_instance(WinxWindow *window) {
   VkPhysicalDeviceFeatures device_features = {0};
   device_features.samplerAnisotropy = VK_TRUE;
   device_features.vertexPipelineStoresAndAtomics = VK_TRUE;
+  if (request & VikRequestFlagsGeometry)
+    device_features.geometryShader = VK_TRUE;
 
   VkDeviceCreateInfo device_create_info = {0};
   device_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -502,6 +521,10 @@ VikInstance *vik_make_instance(WinxWindow *window) {
 
   VkQueue present_queue;
   vkGetDeviceQueue(device, present_queue_family_index, 0, &present_queue);
+
+  VkQueue compute_queue;
+  if (request & VikRequestFlagsCompute)
+    vkGetDeviceQueue(device, graphics_queue_family_index, 0, &compute_queue);
 
   WindowSizeDependantResources resources;
   if (!make_window_size_dependant_resources_except_framebuffers(&resources,
@@ -570,11 +593,13 @@ VikInstance *vik_make_instance(WinxWindow *window) {
   result->device = device;
   result->graphics_queue = graphics_queue;
   result->present_queue = present_queue;
+  result->compute_queue = compute_queue;
   result->resources = resources;
   result->image_available_semaphore = image_available_semaphore;
   result->render_finished_semaphores = render_finished_semaphores;
   result->in_flight_fence = in_flight_fence;
   result->temp_pool = command_pool;
+  result->has_compute = false;
   return result;
 }
 
@@ -609,6 +634,78 @@ VikShader *vik_make_shader_vf(VikInstance *instance, Str vertex_bc, Str fragment
   result->instance = instance;
   result->vertex_module = vertex_module;
   result->fragment_module = fragment_module;
+  result->kind = VikShaderKindVF;
+  return result;
+}
+
+VikShader *vik_make_shader_vgf(VikInstance *instance, Str vertex_bc,
+                                 Str geometry_bc, Str fragment_bc) {
+  VkShaderModuleCreateInfo module_create_info = {0};
+  module_create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+  module_create_info.codeSize = vertex_bc.len;
+  module_create_info.pCode = (u32 *) vertex_bc.ptr;
+
+  VkResult module_result;
+
+  VkShaderModule vertex_module;
+  module_result = vkCreateShaderModule(instance->device, &module_create_info, NULL, &vertex_module);
+  if (module_result != VK_SUCCESS) {
+    sprintf(error_buffer, "Failed to create vertex shader: %s",
+            vk_result_to_cstr(module_result));
+    return NULL;
+  }
+
+  module_create_info.codeSize = geometry_bc.len;
+  module_create_info.pCode = (u32 *) geometry_bc.ptr;
+
+  VkShaderModule geometry_module;
+  module_result = vkCreateShaderModule(instance->device, &module_create_info, NULL, &geometry_module);
+  if (module_result != VK_SUCCESS) {
+    sprintf(error_buffer, "Failed to create geometry shader: %s",
+            vk_result_to_cstr(module_result));
+    return NULL;
+  }
+
+  module_create_info.codeSize = fragment_bc.len;
+  module_create_info.pCode = (u32 *) fragment_bc.ptr;
+
+  VkShaderModule fragment_module;
+  module_result = vkCreateShaderModule(instance->device, &module_create_info, NULL, &fragment_module);
+  if (module_result != VK_SUCCESS) {
+    sprintf(error_buffer, "Failed to create fragment shader: %s",
+            vk_result_to_cstr(module_result));
+    return NULL;
+  }
+
+  VikShader *result = malloc(sizeof(*result));
+  result->instance = instance;
+  result->vertex_module = vertex_module;
+  result->geometry_module = vertex_module;
+  result->fragment_module = fragment_module;
+  result->kind = VikShaderKindVGF;
+  return result;
+}
+
+VikShader *vik_make_shader_c(VikInstance *instance, Str compute_bc) {
+  VkShaderModuleCreateInfo module_create_info = {0};
+  module_create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+  module_create_info.codeSize = compute_bc.len;
+  module_create_info.pCode = (u32 *) compute_bc.ptr;
+
+  VkResult module_result;
+
+  VkShaderModule compute_module;
+  module_result = vkCreateShaderModule(instance->device, &module_create_info, NULL, &compute_module);
+  if (module_result != VK_SUCCESS) {
+    sprintf(error_buffer, "Failed to create vertex shader: %s",
+            vk_result_to_cstr(module_result));
+    return NULL;
+  }
+
+  VikShader *result = malloc(sizeof(*result));
+  result->instance = instance;
+  result->compute_module = compute_module;
+  result->kind = VikShaderKindC;
   return result;
 }
 
@@ -839,20 +936,51 @@ static VkDescriptorType get_vulkan_descriptor_type_for_buffer_kind(VikBufferKind
   return 0;
 }
 
-// TODO: update bind buffers/images
+// TODO: update bound buffers/images
 VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
                                VikAttr *attrs, u32 attrs_len,
                                VikBuffer **buffers, u32 buffers_len,
                                VikImage **images, u32 images_len) {
-  VkPipelineShaderStageCreateInfo shader_stage_infos[2] = {0};
-  shader_stage_infos[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-  shader_stage_infos[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-  shader_stage_infos[0].module = shader->vertex_module;
-  shader_stage_infos[0].pName = "main";
-  shader_stage_infos[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-  shader_stage_infos[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-  shader_stage_infos[1].module = shader->fragment_module;
-  shader_stage_infos[1].pName = "main";
+  u32 shader_stage_infos_len;
+  VkPipelineShaderStageCreateInfo shader_stage_infos[3] = {0};
+
+  switch (shader->kind) {
+  case VikShaderKindVF: {
+    shader_stage_infos_len = 2;
+    shader_stage_infos[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    shader_stage_infos[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    shader_stage_infos[0].module = shader->vertex_module;
+    shader_stage_infos[0].pName = "main";
+    shader_stage_infos[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    shader_stage_infos[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    shader_stage_infos[1].module = shader->fragment_module;
+    shader_stage_infos[1].pName = "main";
+  } break;
+
+  case VikShaderKindVGF: {
+    shader_stage_infos_len = 3;
+    shader_stage_infos[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    shader_stage_infos[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    shader_stage_infos[0].module = shader->vertex_module;
+    shader_stage_infos[0].pName = "main";
+    shader_stage_infos[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    shader_stage_infos[1].stage = VK_SHADER_STAGE_GEOMETRY_BIT;
+    shader_stage_infos[1].module = shader->geometry_module;
+    shader_stage_infos[1].pName = "main";
+    shader_stage_infos[2].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    shader_stage_infos[2].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    shader_stage_infos[2].module = shader->fragment_module;
+    shader_stage_infos[2].pName = "main";
+  } break;
+
+  case VikShaderKindC: {
+    shader_stage_infos_len = 1;
+    shader_stage_infos[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    shader_stage_infos[0].stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    shader_stage_infos[0].module = shader->compute_module;
+    shader_stage_infos[0].pName = "main";
+  } break;
+  }
 
   VkDynamicState dynamic_states[] = {
     VK_DYNAMIC_STATE_VIEWPORT,
@@ -863,77 +991,6 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
   dynamic_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
   dynamic_state.dynamicStateCount = ARRAY_LEN(dynamic_states);
   dynamic_state.pDynamicStates = dynamic_states;
-
-  VkVertexInputBindingDescription vertex_binding_desc =
-    get_vertex_binding_desc_for_attrs(attrs, attrs_len);
-
-  VkVertexInputAttributeDescription *vertex_attr_descs =
-    get_vertex_attr_descs_for_attrs(attrs, attrs_len);
-
-  VkPipelineVertexInputStateCreateInfo vertex_input_create_info = {0};
-  vertex_input_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-  vertex_input_create_info.vertexBindingDescriptionCount = 1;
-  vertex_input_create_info.pVertexBindingDescriptions = &vertex_binding_desc; // Optional
-  vertex_input_create_info.vertexAttributeDescriptionCount = attrs_len;
-  vertex_input_create_info.pVertexAttributeDescriptions = vertex_attr_descs; // Optional
-
-  VkPipelineInputAssemblyStateCreateInfo input_assembly_create_info = {0};
-  input_assembly_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-  input_assembly_create_info.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-  input_assembly_create_info.primitiveRestartEnable = VK_FALSE;
-
-  VkPipelineViewportStateCreateInfo viewport_state_create_info = {0};
-  viewport_state_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-  viewport_state_create_info.viewportCount = 1;
-  viewport_state_create_info.scissorCount = 1;
-
-  VkPipelineRasterizationStateCreateInfo rasterizer_create_info = {0};
-  rasterizer_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-  rasterizer_create_info.depthClampEnable = VK_FALSE;
-  rasterizer_create_info.rasterizerDiscardEnable = VK_FALSE;
-  // TODO: make it customizable to be able to draw wireframe/points
-  // NOTE: requires extensions
-  rasterizer_create_info.polygonMode = VK_POLYGON_MODE_FILL;
-  // TODO: this one too
-  rasterizer_create_info.lineWidth = 1.0f;
-  rasterizer_create_info.cullMode = VK_CULL_MODE_BACK_BIT;
-  rasterizer_create_info.frontFace = VK_FRONT_FACE_CLOCKWISE;
-  rasterizer_create_info.depthBiasEnable = VK_FALSE;
-
-  VkPipelineMultisampleStateCreateInfo multisampling_create_info = {0};
-  multisampling_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-  multisampling_create_info.sampleShadingEnable = VK_FALSE;
-  multisampling_create_info.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-  multisampling_create_info.minSampleShading = 1.0f; // Optional
-  multisampling_create_info.pSampleMask = NULL; // Optional
-  multisampling_create_info.alphaToCoverageEnable = VK_FALSE; // Optional
-  multisampling_create_info.alphaToOneEnable = VK_FALSE; // Optional
-
-  VkPipelineColorBlendAttachmentState color_blend_attachment = {0};
-  color_blend_attachment.colorWriteMask =
-    VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-    VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-  color_blend_attachment.blendEnable = VK_TRUE;
-  color_blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE; // Optional
-  color_blend_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA; // Optional
-  color_blend_attachment.colorBlendOp = VK_BLEND_OP_ADD; // Optional
-  color_blend_attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE; // Optional
-  color_blend_attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO; // Optional
-  color_blend_attachment.alphaBlendOp = VK_BLEND_OP_ADD; // Optional
-  color_blend_attachment.blendEnable = VK_TRUE;
-  color_blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-  color_blend_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-  color_blend_attachment.colorBlendOp = VK_BLEND_OP_ADD;
-  color_blend_attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-  color_blend_attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
-  color_blend_attachment.alphaBlendOp = VK_BLEND_OP_ADD;
-
-  VkPipelineColorBlendStateCreateInfo color_blending_create_info = {0};
-  color_blending_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-  color_blending_create_info.logicOpEnable = VK_FALSE;
-  color_blending_create_info.logicOp = VK_LOGIC_OP_COPY; // Optional
-  color_blending_create_info.attachmentCount = 1;
-  color_blending_create_info.pAttachments = &color_blend_attachment;
 
   u32 ubos_len = 0;
   u32 ssbos_len = 0;
@@ -1125,123 +1182,222 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
   if (pipeline_layout_result != VK_SUCCESS) {
     sprintf(error_buffer, "Failed to create Vulkan pipeline layout: %s",
             vk_result_to_cstr(pipeline_layout_result));
-    free(vertex_attr_descs);
     return NULL;
   }
 
-  VkAttachmentDescription attachment_descs[2] = {0};
-  attachment_descs[0].format = instance->resources.format.format;
-  attachment_descs[0].samples = VK_SAMPLE_COUNT_1_BIT;
-  attachment_descs[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-  attachment_descs[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-  attachment_descs[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-  attachment_descs[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-  attachment_descs[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  attachment_descs[0].finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-  attachment_descs[1].format = VK_FORMAT_D32_SFLOAT;
-  attachment_descs[1].samples = VK_SAMPLE_COUNT_1_BIT;
-  attachment_descs[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-  attachment_descs[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-  attachment_descs[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-  attachment_descs[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-  attachment_descs[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  attachment_descs[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-  VkAttachmentReference color_attachment_ref = {0};
-  color_attachment_ref.attachment = 0;
-  color_attachment_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-  VkAttachmentReference depth_attachment_ref = {0};
-  depth_attachment_ref.attachment = 1;
-  depth_attachment_ref.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-  VkSubpassDescription subpass_desc = {0};
-  subpass_desc.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-  subpass_desc.colorAttachmentCount = 1;
-  subpass_desc.pColorAttachments = &color_attachment_ref;
-  subpass_desc.pDepthStencilAttachment = &depth_attachment_ref;
-
-  VkSubpassDependency dependency = {0};
-  dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
-  dependency.dstSubpass = 0;
-  dependency.srcStageMask =
-    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-    VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-  dependency.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-  dependency.dstStageMask =
-    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-  dependency.dstAccessMask =
-    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-
-  VkRenderPassCreateInfo render_pass_create_info = {0};
-  render_pass_create_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-  render_pass_create_info.attachmentCount = ARRAY_LEN(attachment_descs);
-  render_pass_create_info.pAttachments = attachment_descs;
-  render_pass_create_info.subpassCount = 1;
-  render_pass_create_info.pSubpasses = &subpass_desc;
-  render_pass_create_info.dependencyCount = 1;
-  render_pass_create_info.pDependencies = &dependency;
+  bool is_compute = shader->kind == VikShaderKindC;
 
   VkRenderPass render_pass;
-  VkResult render_pass_result = vkCreateRenderPass(instance->device, &render_pass_create_info, NULL, &render_pass);
-  if (render_pass_result != VK_SUCCESS) {
-    sprintf(error_buffer, "Failed to create Vulkan render pass: %s",
-            vk_result_to_cstr(render_pass_result));
-    free(vertex_attr_descs);
-    return NULL;
-  }
-
-  VkPipelineDepthStencilStateCreateInfo depth_stencil_create_info = {0};
-  depth_stencil_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-  depth_stencil_create_info.depthTestEnable = VK_TRUE;
-  depth_stencil_create_info.depthWriteEnable = VK_TRUE;
-  depth_stencil_create_info.depthCompareOp = VK_COMPARE_OP_LESS;
-
-  VkGraphicsPipelineCreateInfo pipeline_create_info = {0};
-  pipeline_create_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-  pipeline_create_info.stageCount = ARRAY_LEN(shader_stage_infos);
-  pipeline_create_info.pStages = shader_stage_infos;
-  pipeline_create_info.pVertexInputState = &vertex_input_create_info;
-  pipeline_create_info.pInputAssemblyState = &input_assembly_create_info;
-  pipeline_create_info.pViewportState = &viewport_state_create_info;
-  pipeline_create_info.pRasterizationState = &rasterizer_create_info;
-  pipeline_create_info.pMultisampleState = &multisampling_create_info;
-  pipeline_create_info.pDepthStencilState = &depth_stencil_create_info;
-  pipeline_create_info.pColorBlendState = &color_blending_create_info;
-  pipeline_create_info.pDynamicState = &dynamic_state;
-  pipeline_create_info.layout = pipeline_layout;
-  pipeline_create_info.renderPass = render_pass;
-  pipeline_create_info.subpass = 0;
-
-  VkPipeline graphics_pipeline;
-  VkResult pipeline_result = vkCreateGraphicsPipelines(instance->device, VK_NULL_HANDLE, 1, &pipeline_create_info, NULL, &graphics_pipeline);
-  if (pipeline_result != VK_SUCCESS) {
-    sprintf(error_buffer, "Failed to create Vulkan graphics pipeline: %s",
-            vk_result_to_cstr(pipeline_result));
-    free(vertex_attr_descs);
-    return NULL;
-  }
-
+  VkPipeline pipeline;
+  VkResult pipeline_result;
   VkImage depth_image;
   VkDeviceMemory depth_image_memory;
   VkImageView depth_image_view;
-  if (!make_depth_image_and_view(instance->physical_device, instance->device,
-                                 instance->resources.extent, &depth_image,
-                                 &depth_image_memory, &depth_image_view))
-    return NULL;
+  VkFramebuffer *framebuffers;
+  if (is_compute) {
+    VkComputePipelineCreateInfo pipeline_create_info = {0};
+    pipeline_create_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipeline_create_info.layout = pipeline_layout;
+    pipeline_create_info.stage = shader_stage_infos[0];
 
-  VkFramebuffer *framebuffers = malloc(instance->resources.images_len * sizeof(*framebuffers));
-  if (!make_framebuffers(framebuffers, &instance->resources,
-                         instance->device, render_pass,
-                         depth_image_view)) {
-    free(framebuffers);
+    pipeline_result = vkCreateComputePipelines(instance->device, VK_NULL_HANDLE, 1, &pipeline_create_info, NULL, &pipeline);
+  } else {
+    VkVertexInputBindingDescription vertex_binding_desc =
+      get_vertex_binding_desc_for_attrs(attrs, attrs_len);
+
+    VkVertexInputAttributeDescription *vertex_attr_descs =
+      get_vertex_attr_descs_for_attrs(attrs, attrs_len);
+
+    VkPipelineVertexInputStateCreateInfo vertex_input_create_info = {0};
+    vertex_input_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vertex_input_create_info.vertexBindingDescriptionCount = 1;
+    vertex_input_create_info.pVertexBindingDescriptions = &vertex_binding_desc; // Optional
+    vertex_input_create_info.vertexAttributeDescriptionCount = attrs_len;
+    vertex_input_create_info.pVertexAttributeDescriptions = vertex_attr_descs; // Optional
+
+    VkPipelineInputAssemblyStateCreateInfo input_assembly_create_info = {0};
+    input_assembly_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    input_assembly_create_info.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    input_assembly_create_info.primitiveRestartEnable = VK_FALSE;
+
+    VkPipelineViewportStateCreateInfo viewport_state_create_info = {0};
+    viewport_state_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewport_state_create_info.viewportCount = 1;
+    viewport_state_create_info.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rasterizer_create_info = {0};
+    rasterizer_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizer_create_info.depthClampEnable = VK_FALSE;
+    rasterizer_create_info.rasterizerDiscardEnable = VK_FALSE;
+    // TODO: make it customizable to be able to draw wireframe/points
+    // NOTE: requires extensions
+    rasterizer_create_info.polygonMode = VK_POLYGON_MODE_FILL;
+    // TODO: this one too
+    rasterizer_create_info.lineWidth = 1.0f;
+    rasterizer_create_info.cullMode = VK_CULL_MODE_BACK_BIT;
+    rasterizer_create_info.frontFace = VK_FRONT_FACE_CLOCKWISE;
+    rasterizer_create_info.depthBiasEnable = VK_FALSE;
+
+    VkPipelineMultisampleStateCreateInfo multisampling_create_info = {0};
+    multisampling_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisampling_create_info.sampleShadingEnable = VK_FALSE;
+    multisampling_create_info.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    multisampling_create_info.minSampleShading = 1.0f; // Optional
+    multisampling_create_info.pSampleMask = NULL; // Optional
+    multisampling_create_info.alphaToCoverageEnable = VK_FALSE; // Optional
+    multisampling_create_info.alphaToOneEnable = VK_FALSE; // Optional
+
+    VkPipelineColorBlendAttachmentState color_blend_attachment = {0};
+    color_blend_attachment.colorWriteMask =
+      VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    color_blend_attachment.blendEnable = VK_TRUE;
+    color_blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE; // Optional
+    color_blend_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA; // Optional
+    color_blend_attachment.colorBlendOp = VK_BLEND_OP_ADD; // Optional
+    color_blend_attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE; // Optional
+    color_blend_attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO; // Optional
+    color_blend_attachment.alphaBlendOp = VK_BLEND_OP_ADD; // Optional
+    color_blend_attachment.blendEnable = VK_TRUE;
+    color_blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    color_blend_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    color_blend_attachment.colorBlendOp = VK_BLEND_OP_ADD;
+    color_blend_attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    color_blend_attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    color_blend_attachment.alphaBlendOp = VK_BLEND_OP_ADD;
+
+    VkPipelineColorBlendStateCreateInfo color_blending_create_info = {0};
+    color_blending_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    color_blending_create_info.logicOpEnable = VK_FALSE;
+    color_blending_create_info.logicOp = VK_LOGIC_OP_COPY; // Optional
+    color_blending_create_info.attachmentCount = 1;
+    color_blending_create_info.pAttachments = &color_blend_attachment;
+
+    VkAttachmentDescription attachment_descs[2] = {0};
+    attachment_descs[0].format = instance->resources.format.format;
+    attachment_descs[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachment_descs[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachment_descs[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachment_descs[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachment_descs[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachment_descs[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachment_descs[0].finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    attachment_descs[1].format = VK_FORMAT_D32_SFLOAT;
+    attachment_descs[1].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachment_descs[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachment_descs[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachment_descs[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachment_descs[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachment_descs[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachment_descs[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference color_attachment_ref = {0};
+    color_attachment_ref.attachment = 0;
+    color_attachment_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference depth_attachment_ref = {0};
+    depth_attachment_ref.attachment = 1;
+    depth_attachment_ref.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkSubpassDescription subpass_desc = {0};
+    subpass_desc.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass_desc.colorAttachmentCount = 1;
+    subpass_desc.pColorAttachments = &color_attachment_ref;
+    subpass_desc.pDepthStencilAttachment = &depth_attachment_ref;
+
+    VkSubpassDependency dependency = {0};
+    dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependency.dstSubpass = 0;
+    dependency.srcStageMask =
+      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+      VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dependency.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dependency.dstStageMask =
+      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+      VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dependency.dstAccessMask =
+      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+      VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+    VkRenderPassCreateInfo render_pass_create_info = {0};
+    render_pass_create_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    render_pass_create_info.attachmentCount = ARRAY_LEN(attachment_descs);
+    render_pass_create_info.pAttachments = attachment_descs;
+    render_pass_create_info.subpassCount = 1;
+    render_pass_create_info.pSubpasses = &subpass_desc;
+    render_pass_create_info.dependencyCount = 1;
+    render_pass_create_info.pDependencies = &dependency;
+
+    VkResult render_pass_result = vkCreateRenderPass(instance->device, &render_pass_create_info, NULL, &render_pass);
+    if (render_pass_result != VK_SUCCESS) {
+      sprintf(error_buffer, "Failed to create Vulkan render pass: %s",
+              vk_result_to_cstr(render_pass_result));
+      free(vertex_attr_descs);
+      return NULL;
+    }
+
+    VkPipelineDepthStencilStateCreateInfo depth_stencil_create_info = {0};
+    depth_stencil_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depth_stencil_create_info.depthTestEnable = VK_TRUE;
+    depth_stencil_create_info.depthWriteEnable = VK_TRUE;
+    depth_stencil_create_info.depthCompareOp = VK_COMPARE_OP_LESS;
+
+    VkGraphicsPipelineCreateInfo pipeline_create_info = {0};
+    pipeline_create_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipeline_create_info.stageCount = shader_stage_infos_len;
+    pipeline_create_info.pStages = shader_stage_infos;
+    pipeline_create_info.pVertexInputState = &vertex_input_create_info;
+    pipeline_create_info.pInputAssemblyState = &input_assembly_create_info;
+    pipeline_create_info.pViewportState = &viewport_state_create_info;
+    pipeline_create_info.pRasterizationState = &rasterizer_create_info;
+    pipeline_create_info.pMultisampleState = &multisampling_create_info;
+    pipeline_create_info.pDepthStencilState = &depth_stencil_create_info;
+    pipeline_create_info.pColorBlendState = &color_blending_create_info;
+    pipeline_create_info.pDynamicState = &dynamic_state;
+    pipeline_create_info.layout = pipeline_layout;
+    pipeline_create_info.renderPass = render_pass;
+    pipeline_create_info.subpass = 0;
+
+    pipeline_result = vkCreateGraphicsPipelines(instance->device, VK_NULL_HANDLE, 1, &pipeline_create_info, NULL, &pipeline);
+
     free(vertex_attr_descs);
+
+
+    if (!make_depth_image_and_view(instance->physical_device, instance->device,
+                                   instance->resources.extent, &depth_image,
+                                   &depth_image_memory, &depth_image_view))
+      return NULL;
+
+    framebuffers = malloc(instance->resources.images_len * sizeof(*framebuffers));
+    if (!make_framebuffers(framebuffers, &instance->resources,
+                           instance->device, render_pass,
+                           depth_image_view)) {
+      free(framebuffers);
+      return NULL;
+    }
+  }
+
+  if (pipeline_result != VK_SUCCESS) {
+    sprintf(error_buffer, "Failed to create Vulkan graphics pipeline: %s",
+            vk_result_to_cstr(pipeline_result));
     return NULL;
   }
 
-  free(vertex_attr_descs);
+  if (is_compute) {
+    if (!instance->has_compute) {
+      VkSemaphoreCreateInfo semaphore_create_info = {0};
+      semaphore_create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+      VkResult sync_result = vkCreateSemaphore(instance->device, &semaphore_create_info, NULL, &instance->compute_finished_semaphore);
+      if (sync_result != VK_SUCCESS) {
+        sprintf(error_buffer, "Failed to create Vulkan syncronization primitives: %s",
+                vk_result_to_cstr(sync_result));
+        return NULL;
+      }
+    }
+
+    instance->has_compute = true;
+  }
 
   VikPipeline *result = malloc(sizeof(*result));
   result->instance = instance;
@@ -1254,8 +1410,10 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
   result->descriptor_set = descriptor_set;
   result->layout = pipeline_layout;
   result->render_pass = render_pass;
-  result->pipeline = graphics_pipeline;
+  result->pipeline = pipeline;
   result->has_descriptor_set_layout = has_descriptor_set_layout;
+  result->is_compute = is_compute;
+
   return result;
 }
 
@@ -1443,10 +1601,10 @@ VikMesh *vik_make_mesh_sized(VikInstance *instance, void *data,
 
 u32 get_image_format_size(VikImageFormat format) {
   switch (format) {
-  case VikImageFormatR:    return 1;
-  case VikImageFormatRG:   return 2;
-  case VikImageFormatRGB:  return 3;
-  case VikImageFormatRGBA: return 4;
+  case VikImageFormatR8:    return 1;
+  case VikImageFormatRG8:   return 2;
+  case VikImageFormatRGB8:  return 3;
+  case VikImageFormatRGBA8: return 4;
   }
 
   return 0;
@@ -1454,10 +1612,10 @@ u32 get_image_format_size(VikImageFormat format) {
 
 VkFormat get_image_format_vulkan_format(VikImageFormat format) {
   switch (format) {
-  case VikImageFormatR:    return VK_FORMAT_R8_SRGB;
-  case VikImageFormatRG:   return VK_FORMAT_R8G8_SRGB;
-  case VikImageFormatRGB:  return VK_FORMAT_R8G8B8_SRGB;
-  case VikImageFormatRGBA: return VK_FORMAT_R8G8B8A8_SRGB;
+  case VikImageFormatR8:    return VK_FORMAT_R8_SRGB;
+  case VikImageFormatRG8:   return VK_FORMAT_R8G8_SRGB;
+  case VikImageFormatRGB8:  return VK_FORMAT_R8G8B8_SRGB;
+  case VikImageFormatRGBA8: return VK_FORMAT_R8G8B8A8_SRGB;
   }
 
   return 0;
@@ -1753,11 +1911,18 @@ bool vik_end_frame(VikExecutor *executor, VikPipeline *pipeline) {
     return false;
   }
 
-  VkPipelineStageFlags wait_stages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
+  VkSemaphore wait_semaphores[] = {
+    instance->image_available_semaphore,
+    instance->compute_finished_semaphore,
+  };
+  VkPipelineStageFlags wait_stages[] = {
+    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+    VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+  };
   VkSubmitInfo submit_info = {0};
   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-  submit_info.waitSemaphoreCount = 1;
-  submit_info.pWaitSemaphores = &instance->image_available_semaphore;
+  submit_info.waitSemaphoreCount = 1 + instance->has_compute;
+  submit_info.pWaitSemaphores = wait_semaphores;
   submit_info.pWaitDstStageMask = wait_stages;
   submit_info.commandBufferCount = 1;
   submit_info.pCommandBuffers = &executor->buffer;
@@ -1829,27 +1994,74 @@ bool vik_end_frame(VikExecutor *executor, VikPipeline *pipeline) {
   return true;
 }
 
+bool vik_begin_compute_frame(VikExecutor *executor) {
+  vkResetCommandBuffer(executor->buffer, 0);
+
+  VkCommandBufferBeginInfo command_buffer_begin_info = {0};
+  command_buffer_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  command_buffer_begin_info.flags = 0; // Optional
+  command_buffer_begin_info.pInheritanceInfo = NULL; // Optional
+
+  VkResult begin_result = vkBeginCommandBuffer(executor->buffer, &command_buffer_begin_info);
+  if (begin_result != VK_SUCCESS) {
+    sprintf(error_buffer, "Failed to begin recording Vulkan command buffer: %s",
+            vk_result_to_cstr(begin_result));
+    return false;
+  }
+
+  return true;
+}
+
+bool vik_end_compute_frame(VikExecutor *executor) {
+  VikInstance *instance = executor->instance;
+
+  VkResult end_result = vkEndCommandBuffer(executor->buffer);
+  if (end_result != VK_SUCCESS) {
+    sprintf(error_buffer, "Failed to end recording Vulkan command buffer: %s",
+            vk_result_to_cstr(end_result));
+    return false;
+  }
+
+  VkSubmitInfo submit_info = {0};
+  submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submit_info.commandBufferCount = 1;
+  submit_info.pCommandBuffers = &executor->buffer;
+  submit_info.signalSemaphoreCount = 1;
+  submit_info.pSignalSemaphores = &instance->compute_finished_semaphore;
+
+  VkResult submit_result = vkQueueSubmit(instance->graphics_queue, 1, &submit_info, instance->in_flight_fence);
+  if (submit_result != VK_SUCCESS) {
+    sprintf(error_buffer, "Failed to submit compute command: %s",
+            vk_result_to_cstr(submit_result));
+    return false;
+  }
+
+  return true;
+}
+
 void vik_cmd_use_pipeline(VikExecutor *executor, VikPipeline *pipeline) {
   VikInstance *instance = executor->instance;
 
   vkCmdBindPipeline(executor->buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
   vkCmdBindDescriptorSets(executor->buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->layout, 0, 1, &pipeline->descriptor_set, 0, NULL);
 
-  VkViewport viewport = {0};
-  viewport.x = 0.0f;
-  viewport.y = 0.0f;
-  viewport.width = instance->resources.extent.width;
-  viewport.height = instance->resources.extent.height;
-  viewport.minDepth = 0.0f;
-  viewport.maxDepth = 1.0f;
+  if (!pipeline->is_compute) {
+    VkViewport viewport = {0};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = instance->resources.extent.width;
+    viewport.height = instance->resources.extent.height;
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
 
-  vkCmdSetViewport(executor->buffer, 0, 1, &viewport);
+    vkCmdSetViewport(executor->buffer, 0, 1, &viewport);
 
-  VkRect2D scissor = {0};
-  scissor.offset = (VkOffset2D) { 0, 0 };
-  scissor.extent = instance->resources.extent;
+    VkRect2D scissor = {0};
+    scissor.offset = (VkOffset2D) { 0, 0 };
+    scissor.extent = instance->resources.extent;
 
-  vkCmdSetScissor(executor->buffer, 0, 1, &scissor);
+    vkCmdSetScissor(executor->buffer, 0, 1, &scissor);
+  }
 }
 
 // TODO: vik_cmd_wait_on_buffer with vkCmdPipelineBarrier
@@ -1860,6 +2072,10 @@ void vik_cmd_draw(VikExecutor *executor, VikMesh *mesh, u32 instances_len) {
   vkCmdBindVertexBuffers(executor->buffer, 0, 1, &mesh->vertex_buffer, &offset);
   vkCmdBindIndexBuffer(executor->buffer, mesh->index_buffer, 0, VK_INDEX_TYPE_UINT32);
   vkCmdDrawIndexed(executor->buffer, mesh->indices_len, instances_len, 0, 0, 0);
+}
+
+void vik_cmd_compute(VikExecutor *executor, u32 groups_x, u32 groups_y, u32 groups_z) {
+  vkCmdDispatch(executor->buffer, groups_x, groups_y, groups_z);
 }
 
 void *vik_get_buffer_data(VikBuffer *buffer) {
@@ -1912,19 +2128,23 @@ void vik_delete_buffer(VikBuffer *buffer) {
 void vik_delete_pipeline(VikPipeline *pipeline) {
   vkDeviceWaitIdle(pipeline->instance->device);
 
-  vkDestroyImageView(pipeline->instance->device, pipeline->depth_image_view, NULL);
-  vkDestroyImage(pipeline->instance->device, pipeline->depth_image, NULL);
-  vkFreeMemory(pipeline->instance->device, pipeline->depth_image_memory, NULL);
-  for (u32 i = 0; i < pipeline->instance->resources.images_len; ++i)
-    vkDestroyFramebuffer(pipeline->instance->device, pipeline->framebuffers[i], NULL);
+  if (!pipeline->is_compute) {
+    vkDestroyImageView(pipeline->instance->device, pipeline->depth_image_view, NULL);
+    vkDestroyImage(pipeline->instance->device, pipeline->depth_image, NULL);
+    vkFreeMemory(pipeline->instance->device, pipeline->depth_image_memory, NULL);
+    for (u32 i = 0; i < pipeline->instance->resources.images_len; ++i)
+      vkDestroyFramebuffer(pipeline->instance->device, pipeline->framebuffers[i], NULL);
+  }
   vkDestroyPipeline(pipeline->instance->device, pipeline->pipeline, NULL);
-  vkDestroyRenderPass(pipeline->instance->device, pipeline->render_pass, NULL);
+  if (!pipeline->is_compute)
+    vkDestroyRenderPass(pipeline->instance->device, pipeline->render_pass, NULL);
   vkDestroyPipelineLayout(pipeline->instance->device, pipeline->layout, NULL);
   if (pipeline->has_descriptor_set_layout)
     vkDestroyDescriptorSetLayout(pipeline->instance->device, pipeline->descriptor_set_layout, NULL);
   vkDestroyDescriptorPool(pipeline->instance->device, pipeline->descriptor_pool, NULL);
 
-  free(pipeline->framebuffers);
+  if (!pipeline->is_compute)
+    free(pipeline->framebuffers);
   free(pipeline);
 }
 

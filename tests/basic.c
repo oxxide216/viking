@@ -62,12 +62,12 @@ int main(void) {
   Str vertex_bc = read_file("vert.spv");
   Str fragment_bc = read_file("frag.spv");
 
-  VikInstance *instance = vik_make_instance(window);
+  VikInstance *instance = vik_make_instance(window, VikRequestFlagsNone);
   VikShader *shader = vik_make_shader_vf(instance, vertex_bc, fragment_bc);
   VikBuffer *ubo = vik_make_buffer(instance, sizeof(Buffer), VikBufferKindUBO);
   vik_update_buffer(ubo, &buffer);
   VikImage *image = vik_make_image_ex(instance, &image_data, 2, 2,
-                                      VikImageFormatRGBA, VikImageFilterNearest);
+                                      VikImageFormatRGBA8, VikImageFilterNearest);
   VikPipeline *pipeline = vik_make_pipeline(instance, shader,
                                             attrs, ARRAY_LEN(attrs),
                                             &ubo, 1, &image, 1);
