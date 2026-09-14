@@ -10,6 +10,10 @@
 #define vik_make_mesh(instance, data, len, indices, indices_len) \
   vik_make_mesh_sized(instance, data, len, sizeof(*data), indices, indices_len)
 
+#define vik_make_image(instance, data, width, height) \
+  vik_make_image_ex(instance, data, width, height,    \
+                    VikImageFormatRGBA, VikImageFilterLinear)
+
 typedef struct VikInstance VikInstance;
 typedef struct VikShader VikShader;
 typedef struct VikBuffer VikBuffer;
@@ -62,9 +66,6 @@ VikExecutor *vik_make_executor(VikInstance *instance);
 VikMesh     *vik_make_mesh_sized(VikInstance *instance, void *data,
                                  u32 len, u32 vertex_size,
                                  u32 *indices, u32 indices_len);
-// Equivalent to vik_make_image_ex with
-// format = VikImageFormatRGBA and filter = VikImageFilterLinear
-VikImage    *vik_make_image(VikInstance *instance, void *data, u32 width, u32 height);
 VikImage    *vik_make_image_ex(VikInstance *instance, void *data,
                                u32 width, u32 height,
                                VikImageFormat format,

@@ -839,6 +839,7 @@ static VkDescriptorType get_vulkan_descriptor_type_for_buffer_kind(VikBufferKind
   return 0;
 }
 
+// TODO: update bind buffers/images
 VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
                                VikAttr *attrs, u32 attrs_len,
                                VikBuffer **buffers, u32 buffers_len,
@@ -1515,12 +1516,6 @@ static bool change_image_layout(VkImage image, VkImageLayout src, VkImageLayout 
   end_temp_command_buffer(device, graphics_queue, temp_command_pool, command_buffer);
 
   return true;
-}
-
-VikImage *vik_make_image(VikInstance *instance, void *data, u32 width, u32 height) {
-  return vik_make_image_ex(instance, data, width, height,
-                           VikImageFormatRGBA,
-                           VikImageFilterLinear);
 }
 
 // TODO: preallocate samplers and reuse them?
