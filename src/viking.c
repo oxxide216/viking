@@ -38,16 +38,20 @@ struct VikShader {
   VkShaderModule  fragment_module;
 };
 
-struct VikUBO {
+struct VikBuffer {
   VikInstance    *instance;
   VkBuffer        buffer;
   VkDeviceMemory  buffer_memory;
   void           *data;
   u32             size;
+  VikBufferKind   kind;
 };
 
 struct VikPipeline {
   VikInstance           *instance;
+  VkImage                depth_image;
+  VkDeviceMemory         depth_image_memory;
+  VkImageView            depth_image_view;
   VkFramebuffer         *framebuffers;
   VkDescriptorPool       descriptor_pool;
   VkDescriptorSetLayout  descriptor_set_layout;
@@ -55,7 +59,7 @@ struct VikPipeline {
   VkPipelineLayout       layout;
   VkRenderPass           render_pass;
   VkPipeline             pipeline;
-  bool                   has_ubos;
+  bool                   has_descriptor_set_layout;
 };
 
 struct VikExecutor {
@@ -71,6 +75,14 @@ struct VikMesh {
   VkBuffer        index_buffer;
   VkDeviceMemory  index_buffer_memory;
   u32             indices_len;
+};
+
+struct VikImage {
+  VikInstance    *instance;
+  VkImage         image;
+  VkDeviceMemory  memory;
+  VkImageView     view;
+  VkSampler       sampler;
 };
 
 static _Thread_local char error_buffer[128];
@@ -263,13 +275,16 @@ static bool make_window_size_dependant_resources_except_framebuffers(WindowSizeD
 
 static bool make_framebuffers(VkFramebuffer *framebuffers,
                               WindowSizeDependantResources *resources,
-                              VkDevice device, VkRenderPass render_pass) {
+                              VkDevice device, VkRenderPass render_pass,
+                              VkImageView depth_image_view) {
   for (u32 i = 0; i < resources->images_len; ++i) {
+    VkImageView attachments[2] = { resources->image_views[i], depth_image_view };
+
     VkFramebufferCreateInfo framebuffer_create_info = {0};
     framebuffer_create_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
     framebuffer_create_info.renderPass = render_pass;
-    framebuffer_create_info.attachmentCount = 1;
-    framebuffer_create_info.pAttachments = resources->image_views + i;
+    framebuffer_create_info.attachmentCount = ARRAY_LEN(attachments);
+    framebuffer_create_info.pAttachments = attachments;
     framebuffer_create_info.width = resources->extent.width;
     framebuffer_create_info.height = resources->extent.height;
     framebuffer_create_info.layers = 1;
@@ -357,6 +372,9 @@ VikInstance *vik_make_instance(WinxWindow *window) {
       VkPhysicalDeviceProperties device_props;
       vkGetPhysicalDeviceProperties(physical_devices[j], &device_props);
 
+      VkPhysicalDeviceFeatures device_features;
+      vkGetPhysicalDeviceFeatures(physical_devices[j], &device_features);
+
       if (device_props.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU &&
           i == 0)
         continue;
@@ -410,7 +428,9 @@ VikInstance *vik_make_instance(WinxWindow *window) {
       // TODO: also check for swapchain capabilites here
       if (graphics_queue_family_index != (u32) -1 &&
           present_queue_family_index != (u32) -1 &&
-          found_swapchain_device_extension) {
+          found_swapchain_device_extension &&
+          device_features.samplerAnisotropy &&
+          device_features.vertexPipelineStoresAndAtomics) {
         physical_device = physical_devices[j];
         found_suitable_physical_device = true;
       }
@@ -456,6 +476,8 @@ VikInstance *vik_make_instance(WinxWindow *window) {
   const char *device_extensions[] = { "VK_KHR_swapchain" };
 
   VkPhysicalDeviceFeatures device_features = {0};
+  device_features.samplerAnisotropy = VK_TRUE;
+  device_features.vertexPipelineStoresAndAtomics = VK_TRUE;
 
   VkDeviceCreateInfo device_create_info = {0};
   device_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -655,25 +677,9 @@ VkVertexInputAttributeDescription *get_vertex_attr_descs_for_attrs(VikAttr *attr
   return result;
 }
 
-static bool make_buffer(VkPhysicalDevice physical_device, VkDevice device,
-                        u32 size, VkBufferUsageFlags usage, u32 memory_prop_flags,
-                        VkBuffer *out_buffer, VkDeviceMemory *out_buffer_memory) {
-  VkBufferCreateInfo buffer_create_info = {0};
-  buffer_create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-  buffer_create_info.size = size;
-  buffer_create_info.usage = usage;
-  buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-  VkResult buffer_result = vkCreateBuffer(device, &buffer_create_info, NULL, out_buffer);
-  if (buffer_result != VK_SUCCESS) {
-    sprintf(error_buffer, "Failed to create Vulkan buffer: %s",
-            vk_result_to_cstr(buffer_result));
-    return false;
-  }
-
-  VkMemoryRequirements reqs;
-  vkGetBufferMemoryRequirements(device, *out_buffer, &reqs);
-
+static bool alloc(VkPhysicalDevice physical_device, VkDevice device,
+                  u32 memory_prop_flags, VkMemoryRequirements reqs,
+                  VkDeviceMemory *out_buffer_memory) {
   VkPhysicalDeviceMemoryProperties props;
   vkGetPhysicalDeviceMemoryProperties(physical_device, &props);
 
@@ -700,20 +706,54 @@ static bool make_buffer(VkPhysicalDevice physical_device, VkDevice device,
   VkResult buffer_memory_result = vkAllocateMemory(device, &alloc_info, NULL, out_buffer_memory);
   if (buffer_memory_result != VK_SUCCESS) {
     sprintf(error_buffer, "Failed to allocate GPU memory: %s",
-           vk_result_to_cstr(buffer_memory_result));
+            vk_result_to_cstr(buffer_memory_result));
     return false;
   }
+
+  return true;
+}
+
+static bool make_buffer(VkPhysicalDevice physical_device, VkDevice device,
+                        u32 size, VkBufferUsageFlags usage, u32 memory_prop_flags,
+                        VkBuffer *out_buffer, VkDeviceMemory *out_buffer_memory) {
+  VkBufferCreateInfo buffer_create_info = {0};
+  buffer_create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  buffer_create_info.size = size;
+  buffer_create_info.usage = usage;
+  buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+  VkResult buffer_result = vkCreateBuffer(device, &buffer_create_info, NULL, out_buffer);
+  if (buffer_result != VK_SUCCESS) {
+    sprintf(error_buffer, "Failed to create Vulkan buffer: %s",
+            vk_result_to_cstr(buffer_result));
+    return false;
+  }
+
+  VkMemoryRequirements reqs;
+  vkGetBufferMemoryRequirements(device, *out_buffer, &reqs);
+
+  if (!alloc(physical_device, device, memory_prop_flags, reqs, out_buffer_memory))
+    return false;
 
   vkBindBufferMemory(device, *out_buffer, *out_buffer_memory, 0);
 
   return true;
 }
 
-VikUBO *vik_make_ubo(VikInstance *instance, u32 size) {
+static VkBufferUsageFlagBits get_vulkan_buffer_usage_for_buffer_kind(VikBufferKind kind) {
+  switch (kind) {
+  case VikBufferKindUBO:  return VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+  case VikBufferKindSSBO: return VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+  }
+
+  return 0;
+}
+
+VikBuffer *vik_make_buffer(VikInstance *instance, u32 size, VikBufferKind kind) {
   VkBuffer buffer;
   VkDeviceMemory buffer_memory;
   if (!make_buffer(instance->physical_device, instance->device,
-                   size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                   size, get_vulkan_buffer_usage_for_buffer_kind(kind),
                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                    &buffer, &buffer_memory))
@@ -722,18 +762,87 @@ VikUBO *vik_make_ubo(VikInstance *instance, u32 size) {
   void *data;
   vkMapMemory(instance->device, buffer_memory, 0, size, 0, &data);
 
-  VikUBO *result = malloc(sizeof(*result));
+  VikBuffer *result = malloc(sizeof(*result));
   result->instance = instance;
   result->buffer = buffer;
   result->buffer_memory = buffer_memory;
   result->data = data;
   result->size = size;
+  result->kind = kind;
   return result;
+}
+
+bool make_depth_image_and_view(VkPhysicalDevice physical_device, VkDevice device,
+                               VkExtent2D extent, VkImage *out_image,
+                               VkDeviceMemory *out_memory,
+                               VkImageView *out_image_view) {
+  VkImageCreateInfo depth_image_create_info = {0};
+  depth_image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  depth_image_create_info.imageType = VK_IMAGE_TYPE_2D;
+  depth_image_create_info.extent.width = extent.width;
+  depth_image_create_info.extent.height = extent.height;
+  depth_image_create_info.extent.depth = 1;
+  depth_image_create_info.mipLevels = 1;
+  depth_image_create_info.arrayLayers = 1;
+  depth_image_create_info.format = VK_FORMAT_D32_SFLOAT;
+  depth_image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  depth_image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  depth_image_create_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+  depth_image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  depth_image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+  VkResult depth_image_result = vkCreateImage(device, &depth_image_create_info, NULL, out_image);
+  if (depth_image_result != VK_SUCCESS) {
+    sprintf(error_buffer, "Failed to create Vulkan image: %s",
+            vk_result_to_cstr(depth_image_result));
+    return false;
+  }
+
+  VkMemoryRequirements reqs;
+  vkGetImageMemoryRequirements(device, *out_image, &reqs);
+
+  if (!alloc(physical_device, device,
+             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, reqs, out_memory))
+    return false;
+
+  vkBindImageMemory(device, *out_image, *out_memory, 0);
+
+  VkImageViewCreateInfo depth_image_view_create_info = {0};
+  depth_image_view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  depth_image_view_create_info.image = *out_image;
+  depth_image_view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  depth_image_view_create_info.format = depth_image_create_info.format;
+  depth_image_view_create_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+  depth_image_view_create_info.subresourceRange.baseMipLevel = 0;
+  depth_image_view_create_info.subresourceRange.levelCount = 1;
+  depth_image_view_create_info.subresourceRange.baseArrayLayer = 0;
+  depth_image_view_create_info.subresourceRange.layerCount = 1;
+
+  VkResult depth_image_view_result = vkCreateImageView(device,
+                                                       &depth_image_view_create_info,
+                                                       NULL, out_image_view);
+  if (depth_image_view_result != VK_SUCCESS) {
+    sprintf(error_buffer, "Failed to create Vulkan image view: %s",
+            vk_result_to_cstr(depth_image_view_result));
+    return false;
+  }
+
+  return true;
+}
+
+static VkDescriptorType get_vulkan_descriptor_type_for_buffer_kind(VikBufferKind kind) {
+  switch (kind) {
+  case VikBufferKindUBO:  return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  case VikBufferKindSSBO: return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  }
+
+  return 0;
 }
 
 VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
                                VikAttr *attrs, u32 attrs_len,
-                               VikUBO **ubos, u32 ubos_len) {
+                               VikBuffer **buffers, u32 buffers_len,
+                               VikImage **images, u32 images_len) {
   VkPipelineShaderStageCreateInfo shader_stage_infos[2] = {0};
   shader_stage_infos[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
   shader_stage_infos[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -803,7 +912,7 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
   color_blend_attachment.colorWriteMask =
     VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
     VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-  color_blend_attachment.blendEnable = VK_FALSE;
+  color_blend_attachment.blendEnable = VK_TRUE;
   color_blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE; // Optional
   color_blend_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA; // Optional
   color_blend_attachment.colorBlendOp = VK_BLEND_OP_ADD; // Optional
@@ -825,14 +934,42 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
   color_blending_create_info.attachmentCount = 1;
   color_blending_create_info.pAttachments = &color_blend_attachment;
 
-  VkDescriptorPoolSize descriptor_pool_size = {0};
-  descriptor_pool_size.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-  descriptor_pool_size.descriptorCount = ubos_len;
+  u32 ubos_len = 0;
+  u32 ssbos_len = 0;
+  for (u32 i = 0; i < buffers_len; ++i) {
+    switch (buffers[i]->kind) {
+    case VikBufferKindUBO: {
+      ++ubos_len;
+    } break;
+
+    case VikBufferKindSSBO: {
+      ++ssbos_len;
+    } break;
+    }
+  }
+
+  u32 len = 0;
+  VkDescriptorPoolSize descriptor_pool_sizes[2] = {0};
+  if (ubos_len > 0) {
+    descriptor_pool_sizes[len].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    descriptor_pool_sizes[len].descriptorCount = ubos_len;
+    ++len;
+  }
+  if (ssbos_len > 0) {
+    descriptor_pool_sizes[len].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    descriptor_pool_sizes[len].descriptorCount = ssbos_len;
+    ++len;
+  }
+  if (images_len > 0) {
+    descriptor_pool_sizes[len].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    descriptor_pool_sizes[len].descriptorCount = images_len;
+    ++len;
+  }
 
   VkDescriptorPoolCreateInfo descriptor_pool_create_info = {0};
   descriptor_pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  descriptor_pool_create_info.poolSizeCount = 1;
-  descriptor_pool_create_info.pPoolSizes = &descriptor_pool_size;
+  descriptor_pool_create_info.poolSizeCount = len;
+  descriptor_pool_create_info.pPoolSizes = descriptor_pool_sizes;
   descriptor_pool_create_info.maxSets = 1;
 
   VkDescriptorPool descriptor_pool;
@@ -845,28 +982,40 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
     return NULL;
   }
 
+  bool has_descriptor_set_layout = buffers_len > 0 || images_len > 0;
+
   VkDescriptorSetLayout descriptor_set_layout;
   VkDescriptorSet descriptor_set;
-  if (ubos_len > 0) {
+  if (has_descriptor_set_layout) {
     VkDescriptorSetLayoutBinding *layout_bindings =
-      malloc(ubos_len * sizeof(*layout_bindings));
+      malloc((buffers_len + images_len) * sizeof(*layout_bindings));
+    memset(layout_bindings, 0, (buffers_len + images_len) * sizeof(*layout_bindings));
 
-    for (u32 i = 0; i < ubos_len; ++i) {
+    for (u32 i = 0; i < buffers_len; ++i) {
       layout_bindings[i].binding = i;
-      layout_bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+      layout_bindings[i].descriptorType =
+        get_vulkan_descriptor_type_for_buffer_kind(buffers[i]->kind);
       layout_bindings[i].descriptorCount = 1;
       layout_bindings[i].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
     }
 
+    for (u32 i = 0; i < images_len; ++i) {
+      layout_bindings[i + buffers_len].binding = i + buffers_len;
+      layout_bindings[i + buffers_len].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+      layout_bindings[i + buffers_len].descriptorCount = 1;
+      layout_bindings[i + buffers_len].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
+    }
+
     VkDescriptorSetLayoutCreateInfo layout_create_info = {0};
     layout_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layout_create_info.bindingCount = ubos_len;
+    layout_create_info.bindingCount = buffers_len + images_len;
     layout_create_info.pBindings = layout_bindings;
 
     VkResult descriptor_set_layout_result = vkCreateDescriptorSetLayout(instance->device, &layout_create_info, NULL, &descriptor_set_layout);
     if (descriptor_set_layout_result != VK_SUCCESS) {
       sprintf(error_buffer, "Failed to create Vulkan descriptor set layout: %s",
               vk_result_to_cstr(descriptor_set_layout_result));
+      free(layout_bindings);
       return NULL;
     }
 
@@ -886,32 +1035,81 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
       return NULL;
     }
 
-    VkDescriptorBufferInfo *descriptor_buffer_infos =
-      malloc(ubos_len * sizeof(*descriptor_buffer_infos));
+    Da(VkDescriptorBufferInfo) descriptor_ubo_infos = {0};
+    Da(VkDescriptorBufferInfo) descriptor_ssbo_infos = {0};
 
-    for (u32 i = 0; i < ubos_len; ++i) {
-      descriptor_buffer_infos[i].buffer = ubos[i]->buffer;
-      descriptor_buffer_infos[i].offset = 0;
-      descriptor_buffer_infos[i].range = ubos[i]->size;
+    for (u32 i = 0; i < buffers_len; ++i) {
+      VkDescriptorBufferInfo descriptor_buffer_info = {0};
+      descriptor_buffer_info.buffer = buffers[i]->buffer;
+      descriptor_buffer_info.offset = 0;
+      descriptor_buffer_info.range = buffers[i]->size;
+      switch (buffers[i]->kind) {
+      case VikBufferKindUBO: {
+        DA_APPEND(descriptor_ubo_infos, descriptor_buffer_info);
+      } break;
+
+      case VikBufferKindSSBO: {
+        DA_APPEND(descriptor_ssbo_infos, descriptor_buffer_info);
+      } break;
+      }
     }
 
-    VkWriteDescriptorSet descriptor_set_write = {0};
-    descriptor_set_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    descriptor_set_write.dstSet = descriptor_set;
-    descriptor_set_write.dstBinding = 0;
-    descriptor_set_write.dstArrayElement = 0;
-    descriptor_set_write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    descriptor_set_write.descriptorCount = ubos_len;
-    descriptor_set_write.pBufferInfo = descriptor_buffer_infos;
+    VkDescriptorImageInfo *descriptor_image_infos =
+      malloc(images_len * sizeof(*descriptor_image_infos));
+    memset(descriptor_image_infos, 0, images_len * sizeof(*descriptor_image_infos));
 
-    vkUpdateDescriptorSets(instance->device, 1, &descriptor_set_write, 0, NULL);
+    for (u32 i = 0; i < images_len; ++i) {
+      descriptor_image_infos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      descriptor_image_infos[i].imageView = images[i]->view;
+      descriptor_image_infos[i].sampler = images[i]->sampler;
+    }
 
-    free(descriptor_buffer_infos);
+    len = 0;
+    VkWriteDescriptorSet descriptor_set_writes[3] = {0};
+    if (descriptor_ubo_infos.len > 0) {
+      descriptor_set_writes[len].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      descriptor_set_writes[len].dstSet = descriptor_set;
+      descriptor_set_writes[len].dstBinding = len;
+      descriptor_set_writes[len].dstArrayElement = 0;
+      descriptor_set_writes[len].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+      descriptor_set_writes[len].descriptorCount = descriptor_ubo_infos.len;
+      descriptor_set_writes[len].pBufferInfo = descriptor_ubo_infos.items;
+      ++len;
+    }
+    if (descriptor_ssbo_infos.len > 0) {
+      descriptor_set_writes[len].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      descriptor_set_writes[len].dstSet = descriptor_set;
+      descriptor_set_writes[len].dstBinding = len;
+      descriptor_set_writes[len].dstArrayElement = 0;
+      descriptor_set_writes[len].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      descriptor_set_writes[len].descriptorCount = descriptor_ssbo_infos.len;
+      descriptor_set_writes[len].pBufferInfo = descriptor_ssbo_infos.items;
+      ++len;
+    }
+    if (images_len > 0) {
+      descriptor_set_writes[len].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      descriptor_set_writes[len].dstSet = descriptor_set;
+      descriptor_set_writes[len].dstBinding = len;
+      descriptor_set_writes[len].dstArrayElement = 0;
+      descriptor_set_writes[len].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+      descriptor_set_writes[len].descriptorCount = images_len;
+      descriptor_set_writes[len].pImageInfo = descriptor_image_infos;
+      ++len;
+    }
+
+    vkUpdateDescriptorSets(instance->device, len, descriptor_set_writes, 0, NULL);
+
+    if (descriptor_ubo_infos.items)
+      free(descriptor_ubo_infos.items);
+    if (descriptor_ssbo_infos.items)
+      free(descriptor_ssbo_infos.items);
+    if (descriptor_image_infos)
+      free(descriptor_image_infos);
   }
 
   VkPipelineLayoutCreateInfo pipeline_layout_create_info = {0};
   pipeline_layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-  if (ubos_len > 0) {
+  if (has_descriptor_set_layout) {
     pipeline_layout_create_info.setLayoutCount = 1; // Optional
     pipeline_layout_create_info.pSetLayouts = &descriptor_set_layout; // Optional
   } else {
@@ -930,37 +1128,56 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
     return NULL;
   }
 
-  VkAttachmentDescription color_attachment_desc = {0};
-  color_attachment_desc.format = instance->resources.format.format;
-  color_attachment_desc.samples = VK_SAMPLE_COUNT_1_BIT;
-  color_attachment_desc.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-  color_attachment_desc.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-  color_attachment_desc.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-  color_attachment_desc.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-  color_attachment_desc.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  color_attachment_desc.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+  VkAttachmentDescription attachment_descs[2] = {0};
+  attachment_descs[0].format = instance->resources.format.format;
+  attachment_descs[0].samples = VK_SAMPLE_COUNT_1_BIT;
+  attachment_descs[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  attachment_descs[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  attachment_descs[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  attachment_descs[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  attachment_descs[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  attachment_descs[0].finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+  attachment_descs[1].format = VK_FORMAT_D32_SFLOAT;
+  attachment_descs[1].samples = VK_SAMPLE_COUNT_1_BIT;
+  attachment_descs[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  attachment_descs[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  attachment_descs[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  attachment_descs[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  attachment_descs[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  attachment_descs[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
   VkAttachmentReference color_attachment_ref = {0};
   color_attachment_ref.attachment = 0;
   color_attachment_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
+  VkAttachmentReference depth_attachment_ref = {0};
+  depth_attachment_ref.attachment = 1;
+  depth_attachment_ref.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
   VkSubpassDescription subpass_desc = {0};
   subpass_desc.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
   subpass_desc.colorAttachmentCount = 1;
   subpass_desc.pColorAttachments = &color_attachment_ref;
+  subpass_desc.pDepthStencilAttachment = &depth_attachment_ref;
 
   VkSubpassDependency dependency = {0};
   dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
   dependency.dstSubpass = 0;
-  dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-  dependency.srcAccessMask = 0;
-  dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-  dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+  dependency.srcStageMask =
+    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+    VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+  dependency.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+  dependency.dstStageMask =
+    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+  dependency.dstAccessMask =
+    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
   VkRenderPassCreateInfo render_pass_create_info = {0};
   render_pass_create_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-  render_pass_create_info.attachmentCount = 1;
-  render_pass_create_info.pAttachments = &color_attachment_desc;
+  render_pass_create_info.attachmentCount = ARRAY_LEN(attachment_descs);
+  render_pass_create_info.pAttachments = attachment_descs;
   render_pass_create_info.subpassCount = 1;
   render_pass_create_info.pSubpasses = &subpass_desc;
   render_pass_create_info.dependencyCount = 1;
@@ -975,6 +1192,12 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
     return NULL;
   }
 
+  VkPipelineDepthStencilStateCreateInfo depth_stencil_create_info = {0};
+  depth_stencil_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+  depth_stencil_create_info.depthTestEnable = VK_TRUE;
+  depth_stencil_create_info.depthWriteEnable = VK_TRUE;
+  depth_stencil_create_info.depthCompareOp = VK_COMPARE_OP_LESS;
+
   VkGraphicsPipelineCreateInfo pipeline_create_info = {0};
   pipeline_create_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
   pipeline_create_info.stageCount = ARRAY_LEN(shader_stage_infos);
@@ -984,7 +1207,7 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
   pipeline_create_info.pViewportState = &viewport_state_create_info;
   pipeline_create_info.pRasterizationState = &rasterizer_create_info;
   pipeline_create_info.pMultisampleState = &multisampling_create_info;
-  pipeline_create_info.pDepthStencilState = NULL; // Optional
+  pipeline_create_info.pDepthStencilState = &depth_stencil_create_info;
   pipeline_create_info.pColorBlendState = &color_blending_create_info;
   pipeline_create_info.pDynamicState = &dynamic_state;
   pipeline_create_info.layout = pipeline_layout;
@@ -1000,8 +1223,18 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
     return NULL;
   }
 
+  VkImage depth_image;
+  VkDeviceMemory depth_image_memory;
+  VkImageView depth_image_view;
+  if (!make_depth_image_and_view(instance->physical_device, instance->device,
+                                 instance->resources.extent, &depth_image,
+                                 &depth_image_memory, &depth_image_view))
+    return NULL;
+
   VkFramebuffer *framebuffers = malloc(instance->resources.images_len * sizeof(*framebuffers));
-  if (!make_framebuffers(framebuffers, &instance->resources, instance->device, render_pass)) {
+  if (!make_framebuffers(framebuffers, &instance->resources,
+                         instance->device, render_pass,
+                         depth_image_view)) {
     free(framebuffers);
     free(vertex_attr_descs);
     return NULL;
@@ -1011,6 +1244,9 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
 
   VikPipeline *result = malloc(sizeof(*result));
   result->instance = instance;
+  result->depth_image = depth_image;
+  result->depth_image_memory = depth_image_memory;
+  result->depth_image_view = depth_image_view;
   result->framebuffers = framebuffers;
   result->descriptor_pool = descriptor_pool;
   result->descriptor_set_layout = descriptor_set_layout;
@@ -1018,7 +1254,7 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
   result->layout = pipeline_layout;
   result->render_pass = render_pass;
   result->pipeline = graphics_pipeline;
-  result->has_ubos = ubos_len > 0;
+  result->has_descriptor_set_layout = has_descriptor_set_layout;
   return result;
 }
 
@@ -1057,10 +1293,8 @@ VikExecutor *vik_make_executor(VikInstance *instance) {
   return result;
 }
 
-static void copy_buffer_content(VkBuffer dest, VkBuffer src,
-                                VkDeviceSize size, VkDevice device,
-                                VkQueue graphics_queue,
-                                VkCommandPool temp_command_pool) {
+static VkCommandBuffer begin_temp_command_buffer(VkDevice device,
+                                                 VkCommandPool temp_command_pool) {
   VkCommandBufferAllocateInfo alloc_info = {0};
   alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
   alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -1076,10 +1310,13 @@ static void copy_buffer_content(VkBuffer dest, VkBuffer src,
 
   vkBeginCommandBuffer(command_buffer, &begin_info);
 
-  VkBufferCopy copy_region = {0};
-  copy_region.size = size;
-  vkCmdCopyBuffer(command_buffer, src, dest, 1, &copy_region);
+  return command_buffer;
+}
 
+static void end_temp_command_buffer(VkDevice device,
+                                    VkQueue graphics_queue,
+                                    VkCommandPool temp_command_pool,
+                                    VkCommandBuffer command_buffer) {
   vkEndCommandBuffer(command_buffer);
 
   VkSubmitInfo submit_info = {0};
@@ -1091,6 +1328,36 @@ static void copy_buffer_content(VkBuffer dest, VkBuffer src,
   vkQueueWaitIdle(graphics_queue);
 
   vkFreeCommandBuffers(device, temp_command_pool, 1, &command_buffer);
+}
+
+static void copy_buffer_content(VkBuffer dest, VkBuffer src,
+                                VkDeviceSize size, VkDevice device,
+                                VkQueue graphics_queue,
+                                VkCommandPool temp_command_pool) {
+  VkCommandBuffer command_buffer = begin_temp_command_buffer(device, temp_command_pool);
+
+  VkBufferCopy copy_region = {0};
+  copy_region.size = size;
+  vkCmdCopyBuffer(command_buffer, src, dest, 1, &copy_region);
+
+  end_temp_command_buffer(device, graphics_queue, temp_command_pool, command_buffer);
+}
+
+static void copy_buffer_content_to_image(VkImage dest, VkBuffer src,
+                                         u32 width, u32 height, VkDevice device,
+                                         VkQueue graphics_queue,
+                                         VkCommandPool temp_command_pool) {
+  VkCommandBuffer command_buffer = begin_temp_command_buffer(device, temp_command_pool);
+
+  VkBufferImageCopy copy_region = {0};
+  copy_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  copy_region.imageSubresource.layerCount = 1;
+  copy_region.imageExtent = (VkExtent3D) { width, height, 1 };
+  vkCmdCopyBufferToImage(command_buffer, src, dest,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         1, &copy_region);
+
+  end_temp_command_buffer(device, graphics_queue, temp_command_pool, command_buffer);
 }
 
 VikMesh *vik_make_mesh_sized(VikInstance *instance, void *data,
@@ -1173,6 +1440,221 @@ VikMesh *vik_make_mesh_sized(VikInstance *instance, void *data,
   return result;
 }
 
+u32 get_image_format_size(VikImageFormat format) {
+  switch (format) {
+  case VikImageFormatR:    return 1;
+  case VikImageFormatRG:   return 2;
+  case VikImageFormatRGB:  return 3;
+  case VikImageFormatRGBA: return 4;
+  }
+
+  return 0;
+}
+
+VkFormat get_image_format_vulkan_format(VikImageFormat format) {
+  switch (format) {
+  case VikImageFormatR:    return VK_FORMAT_R8_SRGB;
+  case VikImageFormatRG:   return VK_FORMAT_R8G8_SRGB;
+  case VikImageFormatRGB:  return VK_FORMAT_R8G8B8_SRGB;
+  case VikImageFormatRGBA: return VK_FORMAT_R8G8B8A8_SRGB;
+  }
+
+  return 0;
+}
+
+VkFilter get_image_filter_vulkan_filter(VikImageFilter filter) {
+  switch (filter) {
+  case VikImageFilterLinear:  return VK_FILTER_LINEAR;
+  case VikImageFilterNearest: return VK_FILTER_NEAREST;
+  }
+
+  return 0;
+}
+
+static bool change_image_layout(VkImage image, VkImageLayout src, VkImageLayout dest,
+                                VkDevice device, VkCommandPool temp_command_pool,
+                                VkQueue graphics_queue) {
+  VkCommandBuffer command_buffer = begin_temp_command_buffer(device, temp_command_pool);
+
+  VkImageMemoryBarrier barrier = {0};
+  barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  barrier.oldLayout = src;
+  barrier.newLayout = dest;
+  barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.image = image;
+  barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  barrier.subresourceRange.baseMipLevel = 0;
+  barrier.subresourceRange.levelCount = 1;
+  barrier.subresourceRange.baseArrayLayer = 0;
+  barrier.subresourceRange.layerCount = 1;
+
+  VkPipelineStageFlags src_stage;
+  VkPipelineStageFlags dest_stage;
+
+  if (src == VK_IMAGE_LAYOUT_UNDEFINED && dest == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+    src_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    dest_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+  } else if (src == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && dest == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+    src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    dest_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+  } else {
+    sprintf(error_buffer, "Unsupported image layout transition");
+    return false;
+  }
+
+  vkCmdPipelineBarrier(command_buffer, src_stage, dest_stage,
+                       0, 0, NULL, 0, NULL, 1, &barrier);
+
+  end_temp_command_buffer(device, graphics_queue, temp_command_pool, command_buffer);
+
+  return true;
+}
+
+VikImage *vik_make_image(VikInstance *instance, void *data, u32 width, u32 height) {
+  return vik_make_image_ex(instance, data, width, height,
+                           VikImageFormatRGBA,
+                           VikImageFilterLinear);
+}
+
+// TODO: preallocate samplers and reuse them?
+VikImage *vik_make_image_ex(VikInstance *instance, void *data,
+                            u32 width, u32 height,
+                            VikImageFormat format,
+                            VikImageFilter filter) {
+  u32 size = width * height * get_image_format_size(format);
+
+  VkBuffer temp_buffer;
+  VkDeviceMemory temp_buffer_memory;
+  void *gpu_data;
+
+  VkImageCreateInfo image_create_info = {0};
+  image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  image_create_info.imageType = VK_IMAGE_TYPE_2D;
+  image_create_info.extent.width = width;
+  image_create_info.extent.height = height;
+  image_create_info.extent.depth = 1;
+  image_create_info.mipLevels = 1;
+  image_create_info.arrayLayers = 1;
+  image_create_info.format = get_image_format_vulkan_format(format);
+  image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  image_create_info.usage =
+    VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+    VK_IMAGE_USAGE_SAMPLED_BIT;
+  image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+  VkImage image;
+  VkResult image_result = vkCreateImage(instance->device, &image_create_info, NULL, &image);
+  if (image_result != VK_SUCCESS) {
+    sprintf(error_buffer, "Failed to create Vulkan image: %s",
+            vk_result_to_cstr(image_result));
+    return NULL;
+  }
+
+  if (!make_buffer(instance->physical_device, instance->device,
+                   size,
+                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                   &temp_buffer, &temp_buffer_memory))
+    return NULL;
+
+  vkMapMemory(instance->device, temp_buffer_memory, 0, VK_WHOLE_SIZE, 0, &gpu_data);
+  memcpy(gpu_data, data, size);
+  vkUnmapMemory(instance->device, temp_buffer_memory);
+
+  VkMemoryRequirements reqs;
+  vkGetImageMemoryRequirements(instance->device, image, &reqs);
+
+  VkDeviceMemory memory;
+  if (!alloc(instance->physical_device, instance->device,
+             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, reqs, &memory))
+    return NULL;
+
+  vkBindImageMemory(instance->device, image, memory, 0);
+
+  change_image_layout(image, VK_IMAGE_LAYOUT_UNDEFINED,
+                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      instance->device, instance->temp_pool,
+                      instance->graphics_queue);
+  copy_buffer_content_to_image(image, temp_buffer, width, height,
+                               instance->device, instance->graphics_queue,
+                               instance->temp_pool);
+  change_image_layout(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                      instance->device, instance->temp_pool,
+                      instance->graphics_queue);
+
+  vkDestroyBuffer(instance->device, temp_buffer, NULL);
+  vkFreeMemory(instance->device, temp_buffer_memory, NULL);
+
+  VkImageViewCreateInfo view_create_info = {0};
+  view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  view_create_info.image = image;
+  view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view_create_info.format = image_create_info.format;
+  view_create_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  view_create_info.subresourceRange.baseMipLevel = 0;
+  view_create_info.subresourceRange.levelCount = 1;
+  view_create_info.subresourceRange.baseArrayLayer = 0;
+  view_create_info.subresourceRange.layerCount = 1;
+
+  VkImageView view;
+  VkResult view_result = vkCreateImageView(instance->device,
+                                           &view_create_info,
+                                           NULL, &view);
+  if (view_result != VK_SUCCESS) {
+    sprintf(error_buffer, "Failed to create Vulkan image view: %s",
+            vk_result_to_cstr(view_result));
+    return NULL;
+  }
+
+  VkPhysicalDeviceProperties props;
+  vkGetPhysicalDeviceProperties(instance->physical_device, &props);
+
+  VkSamplerCreateInfo sampler_create_info = {0};
+  sampler_create_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+  sampler_create_info.magFilter = get_image_filter_vulkan_filter(filter);
+  sampler_create_info.minFilter = sampler_create_info.minFilter;
+  sampler_create_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+  sampler_create_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+  sampler_create_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+  sampler_create_info.anisotropyEnable = VK_TRUE;
+  sampler_create_info.maxAnisotropy = props.limits.maxSamplerAnisotropy;
+  sampler_create_info.unnormalizedCoordinates = VK_FALSE;
+  sampler_create_info.compareEnable = VK_FALSE;
+  sampler_create_info.compareOp = VK_COMPARE_OP_ALWAYS;
+  sampler_create_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+  sampler_create_info.mipLodBias = 0.0f;
+  sampler_create_info.minLod = 0.0f;
+  sampler_create_info.maxLod = 0.0f;
+
+  VkSampler sampler;
+  VkResult sampler_result = vkCreateSampler(instance->device, &sampler_create_info,
+                                            NULL, &sampler);
+  if (sampler_result != VK_SUCCESS) {
+    sprintf(error_buffer, "Failed to create Vulkan sampler: %s",
+            vk_result_to_cstr(sampler_result));
+    return NULL;
+  }
+
+  VikImage *result = malloc(sizeof(*result));
+  result->instance = instance;
+  result->image = image;
+  result->memory = memory;
+  result->view = view;
+  result->sampler = sampler;
+  return result;
+}
+
 bool vik_begin_frame(VikExecutor *executor, VikPipeline *pipeline,
                      f32 r, f32 g, f32 b, f32 a) {
   VikInstance *instance = executor->instance;
@@ -1186,6 +1668,10 @@ bool vik_begin_frame(VikExecutor *executor, VikPipeline *pipeline,
                                                   VK_NULL_HANDLE, &instance->image_index);
   if (acquire_result == VK_ERROR_OUT_OF_DATE_KHR || acquire_result == VK_SUBOPTIMAL_KHR) {
     vkDeviceWaitIdle(instance->device);
+
+    vkDestroyImageView(instance->device, pipeline->depth_image_view, NULL);
+    vkDestroyImage(instance->device, pipeline->depth_image, NULL);
+    vkFreeMemory(instance->device, pipeline->depth_image_memory, NULL);
 
     for (u32 i = 0; i < instance->resources.images_len; ++i)
       vkDestroyFramebuffer(instance->device, pipeline->framebuffers[i], NULL);
@@ -1207,10 +1693,18 @@ bool vik_begin_frame(VikExecutor *executor, VikPipeline *pipeline,
     if (!ok)
       return false;
 
+    ok = make_depth_image_and_view(instance->physical_device, instance->device,
+                                   instance->resources.extent, &pipeline->depth_image,
+                                   &pipeline->depth_image_memory,
+                                   &pipeline->depth_image_view);
+    if (!ok)
+      return false;
+
     pipeline->framebuffers =
       malloc(instance->resources.images_len * sizeof(*pipeline->framebuffers));
     ok = make_framebuffers(pipeline->framebuffers, &instance->resources,
-                           instance->device, pipeline->render_pass);
+                           instance->device, pipeline->render_pass,
+                           pipeline->depth_image_view);
     if (!ok)
       return false;
 
@@ -1234,7 +1728,9 @@ bool vik_begin_frame(VikExecutor *executor, VikPipeline *pipeline,
     return false;
   }
 
-  VkClearValue clear_color = { { { r, g, b, a } } };
+  VkClearValue clear_values[2] = {0};
+  clear_values[0].color = (VkClearColorValue) { { r, g, b, a } };
+  clear_values[1].depthStencil = (VkClearDepthStencilValue) { 1.0, 0.0 };
 
   VkRenderPassBeginInfo render_pass_begin_info = {0};
   render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -1242,8 +1738,8 @@ bool vik_begin_frame(VikExecutor *executor, VikPipeline *pipeline,
   render_pass_begin_info.framebuffer = pipeline->framebuffers[instance->image_index];
   render_pass_begin_info.renderArea.offset = (VkOffset2D) { 0, 0 };
   render_pass_begin_info.renderArea.extent = instance->resources.extent;
-  render_pass_begin_info.clearValueCount = 1;
-  render_pass_begin_info.pClearValues = &clear_color;
+  render_pass_begin_info.clearValueCount = ARRAY_LEN(clear_values);
+  render_pass_begin_info.pClearValues = clear_values;
 
   vkCmdBeginRenderPass(executor->buffer, &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
 
@@ -1292,6 +1788,10 @@ bool vik_end_frame(VikExecutor *executor, VikPipeline *pipeline) {
   if (draw_result == VK_ERROR_OUT_OF_DATE_KHR || draw_result == VK_SUBOPTIMAL_KHR) {
     vkDeviceWaitIdle(instance->device);
 
+    vkDestroyImageView(instance->device, pipeline->depth_image_view, NULL);
+    vkDestroyImage(instance->device, pipeline->depth_image, NULL);
+    vkFreeMemory(instance->device, pipeline->depth_image_memory, NULL);
+
     for (u32 i = 0; i < instance->resources.images_len; ++i)
       vkDestroyFramebuffer(instance->device, pipeline->framebuffers[i], NULL);
 
@@ -1312,10 +1812,18 @@ bool vik_end_frame(VikExecutor *executor, VikPipeline *pipeline) {
     if (!ok)
       return false;
 
+    ok = make_depth_image_and_view(instance->physical_device, instance->device,
+                                   instance->resources.extent, &pipeline->depth_image,
+                                   &pipeline->depth_image_memory,
+                                   &pipeline->depth_image_view);
+    if (!ok)
+      return false;
+
     pipeline->framebuffers =
       malloc(instance->resources.images_len * sizeof(*pipeline->framebuffers));
     ok = make_framebuffers(pipeline->framebuffers, &instance->resources,
-                           instance->device, pipeline->render_pass);
+                           instance->device, pipeline->render_pass,
+                           pipeline->depth_image_view);
     if (!ok)
       return false;
   } else if (draw_result != VK_SUCCESS) {
@@ -1349,22 +1857,8 @@ void vik_cmd_use_pipeline(VikExecutor *executor, VikPipeline *pipeline) {
   vkCmdSetScissor(executor->buffer, 0, 1, &scissor);
 }
 
-void vik_cmd_wait(VikExecutor *executor) {
-  VkMemoryBarrier2 memory_barrier = {0};
-  memory_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-  memory_barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-  memory_barrier.srcAccessMask = 0;
-  memory_barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-  memory_barrier.dstAccessMask = 0;
-
-  VkDependencyInfo dependency_info = {0};
-  dependency_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-  dependency_info.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
-  dependency_info.memoryBarrierCount = 1;
-  dependency_info.pMemoryBarriers = &memory_barrier;
-
-  vkCmdPipelineBarrier2(executor->buffer, &dependency_info);
-}
+// TODO: vik_cmd_wait_on_buffer with vkCmdPipelineBarrier
+// TODO: vik_cmd_wait_on_image with vkCmdPipelineBarrier
 
 void vik_cmd_draw(VikExecutor *executor, VikMesh *mesh, u32 instances_len) {
   VkDeviceSize offset = 0;
@@ -1373,8 +1867,8 @@ void vik_cmd_draw(VikExecutor *executor, VikMesh *mesh, u32 instances_len) {
   vkCmdDrawIndexed(executor->buffer, mesh->indices_len, instances_len, 0, 0, 0);
 }
 
-void vik_update_ubo(VikUBO *ubo, void *data) {
-  memcpy(ubo->data, data, ubo->size);
+void vik_update_buffer(VikBuffer *buffer, void *data) {
+  memcpy(buffer->data, data, buffer->size);
 }
 
 void vik_delete_instance(VikInstance *instance) {
@@ -1407,24 +1901,27 @@ void vik_delete_shader(VikShader *shader) {
   free(shader);
 }
 
-void vik_delete_ubo(VikUBO *ubo) {
-  vkDeviceWaitIdle(ubo->instance->device);
+void vik_delete_buffer(VikBuffer *buffer) {
+  vkDeviceWaitIdle(buffer->instance->device);
 
-  vkDestroyBuffer(ubo->instance->device, ubo->buffer, NULL);
-  vkFreeMemory(ubo->instance->device, ubo->buffer_memory, NULL);
+  vkDestroyBuffer(buffer->instance->device, buffer->buffer, NULL);
+  vkFreeMemory(buffer->instance->device, buffer->buffer_memory, NULL);
 
-  free(ubo);
+  free(buffer);
 }
 
 void vik_delete_pipeline(VikPipeline *pipeline) {
   vkDeviceWaitIdle(pipeline->instance->device);
 
+  vkDestroyImageView(pipeline->instance->device, pipeline->depth_image_view, NULL);
+  vkDestroyImage(pipeline->instance->device, pipeline->depth_image, NULL);
+  vkFreeMemory(pipeline->instance->device, pipeline->depth_image_memory, NULL);
   for (u32 i = 0; i < pipeline->instance->resources.images_len; ++i)
     vkDestroyFramebuffer(pipeline->instance->device, pipeline->framebuffers[i], NULL);
   vkDestroyPipeline(pipeline->instance->device, pipeline->pipeline, NULL);
   vkDestroyRenderPass(pipeline->instance->device, pipeline->render_pass, NULL);
   vkDestroyPipelineLayout(pipeline->instance->device, pipeline->layout, NULL);
-  if (pipeline->has_ubos)
+  if (pipeline->has_descriptor_set_layout)
     vkDestroyDescriptorSetLayout(pipeline->instance->device, pipeline->descriptor_set_layout, NULL);
   vkDestroyDescriptorPool(pipeline->instance->device, pipeline->descriptor_pool, NULL);
 
@@ -1449,6 +1946,15 @@ void vik_delete_mesh(VikMesh *mesh) {
   vkFreeMemory(mesh->instance->device, mesh->index_buffer_memory, NULL);
 
   free(mesh);
+}
+
+void vik_delete_image(VikImage *image) {
+  vkDestroySampler(image->instance->device, image->sampler, NULL);
+  vkDestroyImageView(image->instance->device, image->view, NULL);
+  vkDestroyImage(image->instance->device, image->image, NULL);
+  vkFreeMemory(image->instance->device, image->memory, NULL);
+
+  free(image);
 }
 
 const char *vik_get_error_str(void) {
