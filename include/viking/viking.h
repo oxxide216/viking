@@ -80,7 +80,8 @@ void vik_cmd_wait_on_buffer(VikExecutor *executor, VikBuffer *buffer);
 void vik_cmd_wait_on_image(VikExecutor *executor, VikImage *image);
 void vik_cmd_draw(VikExecutor *executor, VikMesh *mesh, u32 instances_len);
 
-void vik_update_buffer(VikBuffer *buffer, void *data);
+void *vik_get_buffer_data(VikBuffer *buffer);
+void  vik_update_buffer(VikBuffer *buffer, void *data);
 
 void vik_delete_instance(VikInstance *instance);
 void vik_delete_shader(VikShader *shader);
