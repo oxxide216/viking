@@ -65,7 +65,7 @@ int main(void) {
   VikInstance *instance = vik_make_instance(window, VikRequestFlagsNone);
   VikShader *shader = vik_make_shader_vf(instance, vertex_bc, fragment_bc);
   VikBuffer *ubo = vik_make_buffer(instance, sizeof(Buffer), VikBufferKindUBO);
-  vik_update_buffer(ubo, &buffer);
+  vik_set_buffer_data(ubo, &buffer);
   VikImage *image = vik_make_image_ex(instance, &image_data, 2, 2,
                                       VikImageFormatRGBA8, VikImageFilterNearest);
   VikPipeline *pipeline = vik_make_pipeline(instance, shader,

@@ -2100,7 +2100,7 @@ void *vik_get_buffer_data(VikBuffer *buffer) {
   return buffer->data;
 }
 
-void vik_update_buffer(VikBuffer *buffer, void *data) {
+void vik_set_buffer_data(VikBuffer *buffer, void *data) {
   memcpy(buffer->data, data, buffer->size);
 }
 

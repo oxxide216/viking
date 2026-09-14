@@ -97,7 +97,7 @@ void vik_cmd_draw(VikExecutor *executor, VikMesh *mesh, u32 instances_len);
 void vik_cmd_compute(VikExecutor *executor, u32 groups_x, u32 groups_y, u32 groups_z);
 
 void *vik_get_buffer_data(VikBuffer *buffer);
-void  vik_update_buffer(VikBuffer *buffer, void *data);
+void  vik_set_buffer_data(VikBuffer *buffer, void *data);
 
 void vik_delete_instance(VikInstance *instance);
 void vik_delete_shader(VikShader *shader);
