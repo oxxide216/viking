@@ -1916,7 +1916,8 @@ bool vik_begin_frame(VikExecutor *executor, f32 r, f32 g, f32 b, f32 a) {
 bool vik_end_frame(VikExecutor *executor) {
   VikInstance *instance = executor->instance;
 
-  vkCmdEndRenderPass(executor->buffer);
+  if (instance->graphics_pipelines.len > 0)
+    vkCmdEndRenderPass(executor->buffer);
 
   VkResult end_result = vkEndCommandBuffer(executor->buffer);
   if (end_result != VK_SUCCESS) {
