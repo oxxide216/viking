@@ -1058,14 +1058,14 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
       layout_bindings[i].descriptorType =
         get_vulkan_descriptor_type_for_buffer_kind(buffers[i]->kind);
       layout_bindings[i].descriptorCount = 1;
-      layout_bindings[i].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
+      layout_bindings[i].stageFlags = VK_SHADER_STAGE_ALL;
     }
 
     for (u32 i = 0; i < images_len; ++i) {
       layout_bindings[i + buffers_len].binding = i + buffers_len;
       layout_bindings[i + buffers_len].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
       layout_bindings[i + buffers_len].descriptorCount = 1;
-      layout_bindings[i + buffers_len].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
+      layout_bindings[i + buffers_len].stageFlags = VK_SHADER_STAGE_ALL;
     }
 
     VkDescriptorSetLayoutCreateInfo layout_create_info = {0};
@@ -2014,6 +2014,10 @@ bool vik_end_frame(VikExecutor *executor) {
 }
 
 bool vik_begin_compute_frame(VikExecutor *executor) {
+  VikInstance *instance = executor->instance;
+
+  vkWaitForFences(instance->device, 1, &instance->in_flight_fence, VK_TRUE, UINT64_MAX);
+
   vkResetCommandBuffer(executor->buffer, 0);
 
   VkCommandBufferBeginInfo command_buffer_begin_info = {0};
@@ -2048,7 +2052,7 @@ bool vik_end_compute_frame(VikExecutor *executor) {
   submit_info.signalSemaphoreCount = 1;
   submit_info.pSignalSemaphores = &instance->compute_finished_semaphore;
 
-  VkResult submit_result = vkQueueSubmit(instance->graphics_queue, 1, &submit_info, instance->in_flight_fence);
+  VkResult submit_result = vkQueueSubmit(instance->graphics_queue, 1, &submit_info, VK_NULL_HANDLE);
   if (submit_result != VK_SUCCESS) {
     sprintf(error_buffer, "Failed to submit compute command: %s",
             vk_result_to_cstr(submit_result));
@@ -2061,8 +2065,13 @@ bool vik_end_compute_frame(VikExecutor *executor) {
 void vik_cmd_use_pipeline(VikExecutor *executor, VikPipeline *pipeline) {
   VikInstance *instance = executor->instance;
 
-  vkCmdBindPipeline(executor->buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
-  vkCmdBindDescriptorSets(executor->buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->layout, 0, 1, &pipeline->descriptor_set, 0, NULL);
+  VkPipelineBindPoint bind_point =
+    pipeline->is_compute ?
+    VK_PIPELINE_BIND_POINT_COMPUTE :
+    VK_PIPELINE_BIND_POINT_GRAPHICS;
+
+  vkCmdBindPipeline(executor->buffer, bind_point, pipeline->pipeline);
+  vkCmdBindDescriptorSets(executor->buffer, bind_point, pipeline->layout, 0, 1, &pipeline->descriptor_set, 0, NULL);
 
   if (!pipeline->is_compute) {
     VkViewport viewport = {0};
@@ -2114,6 +2123,8 @@ void vik_delete_instance(VikInstance *instance) {
   for (u32 i = 0; i < instance->resources.images_len; ++i)
     vkDestroySemaphore(instance->device, instance->render_finished_semaphores[i], NULL);
   vkDestroySemaphore(instance->device, instance->image_available_semaphore, NULL);
+  if (instance->has_compute)
+    vkDestroySemaphore(instance->device, instance->compute_finished_semaphore, NULL);
 
   free(instance->render_finished_semaphores);
 
@@ -2131,8 +2142,22 @@ void vik_delete_instance(VikInstance *instance) {
 void vik_delete_shader(VikShader *shader) {
   vkDeviceWaitIdle(shader->instance->device);
 
-  vkDestroyShaderModule(shader->instance->device, shader->vertex_module, NULL);
-  vkDestroyShaderModule(shader->instance->device, shader->fragment_module, NULL);
+  switch (shader->kind) {
+  case VikShaderKindVF: {
+    vkDestroyShaderModule(shader->instance->device, shader->vertex_module, NULL);
+    vkDestroyShaderModule(shader->instance->device, shader->fragment_module, NULL);
+  } break;
+
+  case VikShaderKindVGF: {
+    vkDestroyShaderModule(shader->instance->device, shader->vertex_module, NULL);
+    vkDestroyShaderModule(shader->instance->device, shader->geometry_module, NULL);
+    vkDestroyShaderModule(shader->instance->device, shader->fragment_module, NULL);
+  } break;
+
+  case VikShaderKindC: {
+    vkDestroyShaderModule(shader->instance->device, shader->compute_module, NULL);
+  } break;
+  }
 
   free(shader);
 }
