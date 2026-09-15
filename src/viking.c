@@ -36,6 +36,7 @@ struct VikInstance {
   VikPipelines                  graphics_pipelines;
   u32                           image_index;
   bool                          has_compute;
+  bool                          was_compute_used_in_this_frame;
 };
 
 typedef enum {
@@ -604,6 +605,7 @@ VikInstance *vik_make_instance(WinxWindow *window, VikRequestFlags request) {
   result->temp_pool = command_pool;
   result->graphics_pipelines = (VikPipelines) {0};
   result->has_compute = false;
+  result->was_compute_used_in_this_frame = false;
   return result;
 }
 
@@ -1936,13 +1938,15 @@ bool vik_end_frame(VikExecutor *executor) {
   };
   VkSubmitInfo submit_info = {0};
   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-  submit_info.waitSemaphoreCount = 1 + instance->has_compute;
+  submit_info.waitSemaphoreCount = 1 + instance->was_compute_used_in_this_frame;
   submit_info.pWaitSemaphores = wait_semaphores;
   submit_info.pWaitDstStageMask = wait_stages;
   submit_info.commandBufferCount = 1;
   submit_info.pCommandBuffers = &executor->buffer;
   submit_info.signalSemaphoreCount = 1;
   submit_info.pSignalSemaphores = instance->render_finished_semaphores + instance->image_index;
+
+  instance->was_compute_used_in_this_frame = false;
 
   VkResult submit_result = vkQueueSubmit(instance->graphics_queue, 1, &submit_info, instance->in_flight_fence);
   if (submit_result != VK_SUCCESS) {
@@ -2015,6 +2019,8 @@ bool vik_end_frame(VikExecutor *executor) {
 
 bool vik_begin_compute_frame(VikExecutor *executor) {
   VikInstance *instance = executor->instance;
+
+  instance->was_compute_used_in_this_frame = true;
 
   vkWaitForFences(instance->device, 1, &instance->in_flight_fence, VK_TRUE, UINT64_MAX);
 
