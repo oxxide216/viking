@@ -686,7 +686,7 @@ VikShader *vik_make_shader_vgf(VikInstance *instance, Str vertex_bc,
   VikShader *result = malloc(sizeof(*result));
   result->instance = instance;
   result->vertex_module = vertex_module;
-  result->geometry_module = vertex_module;
+  result->geometry_module = geometry_module;
   result->fragment_module = fragment_module;
   result->kind = VikShaderKindVGF;
   return result;
