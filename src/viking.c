@@ -1049,7 +1049,7 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
   bool has_descriptor_set_layout = buffers_len > 0 || images_len > 0;
 
   VkDescriptorSetLayout descriptor_set_layout;
-  VkDescriptorSet descriptor_set;
+  VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
   if (has_descriptor_set_layout) {
     VkDescriptorSetLayoutBinding *layout_bindings =
       malloc((buffers_len + images_len) * sizeof(*layout_bindings));
@@ -2077,7 +2077,8 @@ void vik_cmd_use_pipeline(VikExecutor *executor, VikPipeline *pipeline) {
     VK_PIPELINE_BIND_POINT_GRAPHICS;
 
   vkCmdBindPipeline(executor->buffer, bind_point, pipeline->pipeline);
-  vkCmdBindDescriptorSets(executor->buffer, bind_point, pipeline->layout, 0, 1, &pipeline->descriptor_set, 0, NULL);
+  if (pipeline->descriptor_set != VK_NULL_HANDLE)
+    vkCmdBindDescriptorSets(executor->buffer, bind_point, pipeline->layout, 0, 1, &pipeline->descriptor_set, 0, NULL);
 
   if (!pipeline->is_compute) {
     VkViewport viewport = {0};
