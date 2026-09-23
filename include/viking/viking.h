@@ -91,13 +91,15 @@ bool vik_begin_compute_frame(VikExecutor *executor);
 bool vik_end_compute_frame(VikExecutor *executor);
 
 void vik_cmd_use_pipeline(VikExecutor *executor, VikPipeline *pipeline);
-void vik_cmd_wait_on_buffer(VikExecutor *executor, VikBuffer *buffer);
-void vik_cmd_wait_on_image(VikExecutor *executor, VikImage *image);
 void vik_cmd_draw(VikExecutor *executor, VikMesh *mesh, u32 instances_len);
 void vik_cmd_compute(VikExecutor *executor, u32 groups_x, u32 groups_y, u32 groups_z);
 
 void *vik_get_buffer_data(VikBuffer *buffer);
 void  vik_set_buffer_data(VikBuffer *buffer, void *data);
+
+void vik_use_resources(VikPipeline *pipeline,
+                       VikBuffer **buffers, u32 buffers_len,
+                       VikImage **images, u32 images_len);
 
 void vik_delete_instance(VikInstance *instance);
 void vik_delete_shader(VikShader *shader);
