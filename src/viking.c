@@ -285,7 +285,7 @@ static bool make_window_size_dependant_resources_except_framebuffers(WindowSizeD
 
     result->format = formats[0];
     for (u32 i = 0; i < formats_len; ++i) {
-      if (formats[i].format == VK_FORMAT_B8G8R8A8_SRGB && formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+      if (formats[i].format == VK_FORMAT_B8G8R8A8_UNORM && formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
         result->format = formats[i];
         break;
       }
