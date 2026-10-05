@@ -63,7 +63,9 @@ typedef enum {
   VikImageFilterNearest,
 } VikImageFilter;
 
-VikInstance *vik_make_instance(WinxWindow *window, VikRequestFlags request);
+VikInstance *vik_make_instance(WinxWindow *window,
+                               VikRequestFlags request,
+                               bool enable_depth);
 // "vf" stands for vertex/fragment and "bc" stands for bytecode
 VikShader   *vik_make_shader_vf(VikInstance *instance, Str vertex_bc, Str fragment_bc);
 // "vgf" stands for vertex/geometry/fragment and "bc" stands for bytecode

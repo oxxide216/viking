@@ -42,6 +42,7 @@ struct VikInstance {
   u32                           image_index;
   bool                          has_compute;
   bool                          was_compute_used_in_this_frame;
+  bool                          has_depth;
 };
 
 typedef enum {
@@ -265,10 +266,11 @@ static bool make_depth_image_and_view(VkPhysicalDevice physical_device, VkDevice
 
 static bool make_window_size_dependant_resources_except_framebuffers(WindowSizeDependantResources *result,
                                                                      VkPhysicalDevice physical_device, VkDevice device,
-                                                                                             VkSurfaceKHR surface,
-                                                                                             u32 graphics_queue_family_index,
-                                                                                             u32 present_queue_family_index,
-                                                                                             u32 window_width, u32 window_height) {
+                                                                     VkSurfaceKHR surface,
+                                                                     u32 graphics_queue_family_index,
+                                                                     u32 present_queue_family_index,
+                                                                     u32 window_width, u32 window_height,
+                                                                    bool enable_depth) {
   VkSurfaceCapabilitiesKHR capabilities;
   vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, &capabilities);
 
@@ -381,17 +383,19 @@ static bool make_window_size_dependant_resources_except_framebuffers(WindowSizeD
     }
   }
 
-  if (!make_depth_image_and_view(physical_device, device,
-                                 result->extent, &result->depth_image,
-                                 &result->depth_image_memory,
-                                 &result->depth_image_view))
-    return false;
+  if (enable_depth)
+    if (!make_depth_image_and_view(physical_device, device,
+                                   result->extent, &result->depth_image,
+                                   &result->depth_image_memory,
+                                   &result->depth_image_view))
+      return false;
 
   return true;
 }
 
 static bool make_framebuffers(WindowSizeDependantResources *resources,
-                              VkDevice device, VkRenderPass render_pass) {
+                              VkDevice device, VkRenderPass render_pass,
+                              bool enable_depth) {
   for (u32 i = 0; i < resources->images_len; ++i) {
     VkImageView attachments[2] = {
       resources->image_views[i],
@@ -401,7 +405,7 @@ static bool make_framebuffers(WindowSizeDependantResources *resources,
     VkFramebufferCreateInfo framebuffer_create_info = {0};
     framebuffer_create_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
     framebuffer_create_info.renderPass = render_pass;
-    framebuffer_create_info.attachmentCount = ARRAY_LEN(attachments);
+    framebuffer_create_info.attachmentCount = 1 + enable_depth;
     framebuffer_create_info.pAttachments = attachments;
     framebuffer_create_info.width = resources->extent.width;
     framebuffer_create_info.height = resources->extent.height;
@@ -429,7 +433,9 @@ static void delete_window_size_dependant_resources(WindowSizeDependantResources 
   vkDestroySwapchainKHR(device, resources->swap_chain, NULL);
 }
 
-VikInstance *vik_make_instance(WinxWindow *window, VikRequestFlags request) {
+VikInstance *vik_make_instance(WinxWindow *window,
+                               VikRequestFlags request,
+                               bool enable_depth) {
   VkApplicationInfo app_info = {0};
   app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
   app_info.pApplicationName = APP_NAME;
@@ -441,7 +447,9 @@ VikInstance *vik_make_instance(WinxWindow *window, VikRequestFlags request) {
   u32 extensions_len;
   const char * const *extensions = winx_get_vulkan_extensions(&extensions_len);
 
-#ifndef VIK_NDEBUG
+#ifdef VIK_NDEBUG
+  const char *layers[] = {};
+#else
   const char *layers[] = { "VK_LAYER_KHRONOS_validation" };
 #endif
 
@@ -450,13 +458,8 @@ VikInstance *vik_make_instance(WinxWindow *window, VikRequestFlags request) {
   instance_create_info.pApplicationInfo = &app_info;
   instance_create_info.enabledExtensionCount = extensions_len;
   instance_create_info.ppEnabledExtensionNames = extensions;
-#ifndef VIK_NDEBUG
   instance_create_info.enabledLayerCount = ARRAY_LEN(layers);
   instance_create_info.ppEnabledLayerNames = layers;
-#else
-  instance_create_info.enabledLayerCount = 0;
-  instance_create_info.ppEnabledLayerNames = NULL;
-#endif
 
   VkInstance instance;
   VkResult instance_result = vkCreateInstance(&instance_create_info, NULL, &instance);
@@ -636,7 +639,8 @@ VikInstance *vik_make_instance(WinxWindow *window, VikRequestFlags request) {
                                                                 physical_device, device, surface,
                                                                 graphics_queue_family_index,
                                                                 present_queue_family_index,
-                                                                window->width, window->height))
+                                                                window->width, window->height,
+                                                               enable_depth))
     return NULL;
 
   VkAttachmentDescription attachment_descs[2] = {0};
@@ -648,14 +652,16 @@ VikInstance *vik_make_instance(WinxWindow *window, VikRequestFlags request) {
   attachment_descs[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
   attachment_descs[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   attachment_descs[0].finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-  attachment_descs[1].format = VK_FORMAT_D32_SFLOAT;
-  attachment_descs[1].samples = VK_SAMPLE_COUNT_1_BIT;
-  attachment_descs[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-  attachment_descs[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-  attachment_descs[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-  attachment_descs[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
-  attachment_descs[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  attachment_descs[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  if (enable_depth) {
+    attachment_descs[1].format = VK_FORMAT_D32_SFLOAT;
+    attachment_descs[1].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachment_descs[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachment_descs[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachment_descs[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachment_descs[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachment_descs[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachment_descs[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  }
 
   VkAttachmentReference color_attachment_ref = {0};
   color_attachment_ref.attachment = 0;
@@ -669,7 +675,8 @@ VikInstance *vik_make_instance(WinxWindow *window, VikRequestFlags request) {
   subpass_desc.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
   subpass_desc.colorAttachmentCount = 1;
   subpass_desc.pColorAttachments = &color_attachment_ref;
-  subpass_desc.pDepthStencilAttachment = &depth_attachment_ref;
+  if (enable_depth)
+    subpass_desc.pDepthStencilAttachment = &depth_attachment_ref;
 
   VkSubpassDependency dependency = {0};
   dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
@@ -687,7 +694,7 @@ VikInstance *vik_make_instance(WinxWindow *window, VikRequestFlags request) {
 
   VkRenderPassCreateInfo render_pass_create_info = {0};
   render_pass_create_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-  render_pass_create_info.attachmentCount = ARRAY_LEN(attachment_descs);
+  render_pass_create_info.attachmentCount = 1 + enable_depth;
   render_pass_create_info.pAttachments = attachment_descs;
   render_pass_create_info.subpassCount = 1;
   render_pass_create_info.pSubpasses = &subpass_desc;
@@ -703,9 +710,8 @@ VikInstance *vik_make_instance(WinxWindow *window, VikRequestFlags request) {
   }
 
   resources.framebuffers = malloc(resources.images_len * sizeof(*resources.framebuffers));
-  if (!make_framebuffers(&resources, device, render_pass)) {
+  if (!make_framebuffers(&resources, device, render_pass, enable_depth))
     return NULL;
-  }
 
   VkSemaphore image_available_semaphore;
   VkSemaphore *render_finished_semaphores = malloc(resources.images_len * sizeof(*render_finished_semaphores));
@@ -775,6 +781,7 @@ VikInstance *vik_make_instance(WinxWindow *window, VikRequestFlags request) {
   result->temp_pool = command_pool;
   result->has_compute = false;
   result->was_compute_used_in_this_frame = false;
+  result->has_depth = enable_depth;
   return result;
 }
 
@@ -1845,7 +1852,8 @@ bool vik_begin_frame(VikExecutor *executor, f32 r, f32 g, f32 b, f32 a) {
                                                                   instance->graphics_queue_family_index,
                                                                   instance->present_queue_family_index,
                                                                   instance->window->width,
-                                                                  instance->window->height);
+                                                                  instance->window->height,
+                                                                 instance->has_depth);
     if (!ok)
       return false;
 
@@ -1854,7 +1862,8 @@ bool vik_begin_frame(VikExecutor *executor, f32 r, f32 g, f32 b, f32 a) {
              sizeof(*instance->resources.framebuffers));
     ok = make_framebuffers(&instance->resources,
                            instance->device,
-                           instance->render_pass);
+                           instance->render_pass,
+                           instance->has_depth);
     if (!ok)
       return false;
 
@@ -1948,9 +1957,11 @@ bool vik_end_frame(VikExecutor *executor) {
   if (draw_result == VK_ERROR_OUT_OF_DATE_KHR || draw_result == VK_SUBOPTIMAL_KHR) {
     vkDeviceWaitIdle(instance->device);
 
-    vkDestroyImageView(instance->device, instance->resources.depth_image_view, NULL);
-    vkDestroyImage(instance->device, instance->resources.depth_image, NULL);
-    vkFreeMemory(instance->device, instance->resources.depth_image_memory, NULL);
+    if (instance->has_depth) {
+      vkDestroyImageView(instance->device, instance->resources.depth_image_view, NULL);
+      vkDestroyImage(instance->device, instance->resources.depth_image, NULL);
+      vkFreeMemory(instance->device, instance->resources.depth_image_memory, NULL);
+    }
 
     for (u32 i = 0; i < instance->resources.images_len; ++i)
       vkDestroyFramebuffer(instance->device, instance->resources.framebuffers[i], NULL);
@@ -1968,7 +1979,8 @@ bool vik_end_frame(VikExecutor *executor) {
                                                                   instance->graphics_queue_family_index,
                                                                   instance->present_queue_family_index,
                                                                   instance->window->width,
-                                                                  instance->window->height);
+                                                                  instance->window->height,
+                                                                 instance->has_depth);
     if (!ok)
       return false;
 
@@ -1977,7 +1989,8 @@ bool vik_end_frame(VikExecutor *executor) {
              sizeof(*instance->resources.framebuffers));
     ok = make_framebuffers(&instance->resources,
                            instance->device,
-                           instance->render_pass);
+                           instance->render_pass,
+                           instance->has_depth);
     if (!ok)
       return false;
   } else if (draw_result != VK_SUCCESS) {
@@ -2112,9 +2125,11 @@ void vik_delete_instance(VikInstance *instance) {
 
   free(instance->render_finished_semaphores);
 
-  vkDestroyImageView(instance->device, instance->resources.depth_image_view, NULL);
-  vkDestroyImage(instance->device, instance->resources.depth_image, NULL);
-  vkFreeMemory(instance->device, instance->resources.depth_image_memory, NULL);
+  if (instance->has_depth) {
+    vkDestroyImageView(instance->device, instance->resources.depth_image_view, NULL);
+    vkDestroyImage(instance->device, instance->resources.depth_image, NULL);
+    vkFreeMemory(instance->device, instance->resources.depth_image_memory, NULL);
+  }
   for (u32 i = 0; i < instance->resources.images_len; ++i)
     vkDestroyFramebuffer(instance->device, instance->resources.framebuffers[i], NULL);
 
