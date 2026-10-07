@@ -1173,6 +1173,7 @@ static void pipeline_use_resources(VkDevice device,
     ++len;
   }
 
+  vkDeviceWaitIdle(device);
   vkUpdateDescriptorSets(device, len, descriptor_set_writes, 0, NULL);
 
   if (descriptor_ubo_infos.items)
