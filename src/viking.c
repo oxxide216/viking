@@ -493,7 +493,7 @@ VikInstance *vik_make_instance(WinxWindow *window,
   u32 graphics_queue_family_index;
   u32 present_queue_family_index;
 
-  for (u32 i = 0; i < 1; ++i) {
+  for (u32 i = 0; i < 2; ++i) {
     for (u32 j = 0; j < physical_devices_len; ++j) {
       VkPhysicalDeviceProperties device_props;
       vkGetPhysicalDeviceProperties(physical_devices[j], &device_props);
@@ -936,6 +936,20 @@ VikInstance *vik_make_headless_instance(VikRequestFlags request) {
   if (request & VikRequestFlagsCompute)
     vkGetDeviceQueue(device, graphics_queue_family_index, 0, &compute_queue);
 
+  VkFence in_flight_fence;
+  VkFenceCreateInfo fence_create_info = {0};
+
+  fence_create_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+  fence_create_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+
+  VkResult = sync_result = vkCreateFence(device, &fence_create_info,
+                                         NULL, &in_flight_fence);
+  if (sync_result != VK_SUCCESS) {
+    sprintf(error_buffer, "Failed to create Vulkan syncronization primitives: %s",
+            vk_result_to_cstr(sync_result));
+    return NULL;
+  }
+
   VkCommandPoolCreateInfo command_pool_create_info = {0};
   command_pool_create_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
   command_pool_create_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -955,6 +969,7 @@ VikInstance *vik_make_headless_instance(VikRequestFlags request) {
   result->graphics_queue_family_index = graphics_queue_family_index;
   result->device = device;
   result->compute_queue = compute_queue;
+  result->in_flight_fence = in_flight_fence;
   result->temp_pool = command_pool;
   result->has_compute = false;
   result->is_headless = true;
@@ -1171,13 +1186,21 @@ static VkBufferUsageFlagBits get_vulkan_buffer_usage_for_buffer_kind(VikBufferKi
 VikBuffer *vik_make_buffer(VikInstance *instance, u32 size,
                            VikBufferKind kind,
                            VikBufferAccess access) {
+  u32 memory_prop_flags;
+  if (access == VikBufferAccessCPU)
+    memory_prop_flags =
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+  else
+    memory_prop_flags =
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+      VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD;
+
   VkBuffer buffer;
   VkDeviceMemory buffer_memory;
   if (!make_buffer(instance->physical_device, instance->device,
                    size, get_vulkan_buffer_usage_for_buffer_kind(kind),
-                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                   &buffer, &buffer_memory))
+                   memory_prop_flags, &buffer, &buffer_memory))
     return NULL;
 
   assert(access != VikBufferAccessStaging);
@@ -2302,8 +2325,8 @@ void vik_delete_instance(VikInstance *instance) {
 
   vkDestroyCommandPool(instance->device, instance->temp_pool, NULL);
 
+  vkDestroyFence(instance->device, instance->in_flight_fence, NULL);
   if (!instance->is_headless) {
-    vkDestroyFence(instance->device, instance->in_flight_fence, NULL);
     for (u32 i = 0; i < instance->resources.images_len; ++i)
       vkDestroySemaphore(instance->device, instance->render_finished_semaphores[i], NULL);
     vkDestroySemaphore(instance->device, instance->image_available_semaphore, NULL);
