@@ -71,6 +71,7 @@ struct VikBuffer {
   void           *data;
   u32             size;
   VikBufferKind   kind;
+  VikBufferAccess access;
 };
 
 struct VikPipeline {
@@ -1186,6 +1187,10 @@ static VkBufferUsageFlagBits get_vulkan_buffer_usage_for_buffer_kind(VikBufferKi
 VikBuffer *vik_make_buffer(VikInstance *instance, u32 size,
                            VikBufferKind kind,
                            VikBufferAccess access) {
+  VkBufferUsageFlagBits usage = get_vulkan_buffer_usage_for_buffer_kind(kind);
+  if (access == VikBufferAccessStaging)
+    usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
   u32 memory_prop_flags;
   if (access == VikBufferAccessCPU)
     memory_prop_flags =
@@ -1198,12 +1203,9 @@ VikBuffer *vik_make_buffer(VikInstance *instance, u32 size,
 
   VkBuffer buffer;
   VkDeviceMemory buffer_memory;
-  if (!make_buffer(instance->physical_device, instance->device,
-                   size, get_vulkan_buffer_usage_for_buffer_kind(kind),
-                   memory_prop_flags, &buffer, &buffer_memory))
+  if (!make_buffer(instance->physical_device, instance->device, size,
+                   usage, memory_prop_flags, &buffer, &buffer_memory))
     return NULL;
-
-  assert(access != VikBufferAccessStaging);
 
   void *data = NULL;
   if (access == VikBufferAccessCPU)
@@ -1216,6 +1218,7 @@ VikBuffer *vik_make_buffer(VikInstance *instance, u32 size,
   result->data = data;
   result->size = size;
   result->kind = kind;
+  result->access = access;
   return result;
 }
 
@@ -2308,11 +2311,42 @@ void vik_cmd_compute(VikExecutor *executor, u32 groups_x, u32 groups_y, u32 grou
 }
 
 void *vik_get_buffer_data(VikBuffer *buffer) {
+  assert(buffer->access == VikBufferAccessCPU);
   return buffer->data;
 }
 
 void vik_set_buffer_data(VikBuffer *buffer, void *data) {
-  memcpy(buffer->data, data, buffer->size);
+  assert(buffer->access != VikBufferAccessGPU);
+
+  if (buffer->access == VikBufferAccessCPU) {
+    memcpy(buffer->data, data, buffer->size);
+  } else if (buffer->access == VikBufferAccessStaging) {
+    VkBuffer temp_buffer;
+    VkDeviceMemory temp_buffer_memory;
+    void *gpu_data;
+
+    if (!make_buffer(buffer->instance->physical_device,
+                     buffer->instance->device,
+                     buffer->size,
+                     get_vulkan_buffer_usage_for_buffer_kind(buffer->kind) |
+                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     &temp_buffer, &temp_buffer_memory))
+      return;
+
+    vkMapMemory(buffer->instance->device, temp_buffer_memory,
+                0, VK_WHOLE_SIZE, 0, &gpu_data);
+    memcpy(gpu_data, data, buffer->size);
+    vkUnmapMemory(buffer->instance->device, temp_buffer_memory);
+    copy_buffer_content(buffer->buffer, temp_buffer, buffer->size,
+                        buffer->instance->device,
+                        buffer->instance->graphics_queue,
+                        buffer->instance->temp_pool);
+
+    vkDestroyBuffer(buffer->instance->device, temp_buffer, NULL);
+    vkFreeMemory(buffer->instance->device, temp_buffer_memory, NULL);
+  }
 }
 
 void vik_use_resources(VikPipeline *pipeline,
