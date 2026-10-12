@@ -22,7 +22,9 @@ typedef Da(VikPipeline *) VikPipelines;
 
 // TODO: separate swapchain and surface from instance
 struct VikInstance {
+#ifndef VIK_HEADLESS
   WinxWindow                   *window;
+#endif
   VkInstance                    instance;
   VkSurfaceKHR                  surface;
   VkPhysicalDevice              physical_device;
@@ -43,6 +45,7 @@ struct VikInstance {
   bool                          has_compute;
   bool                          was_compute_used_in_this_frame;
   bool                          has_depth;
+  bool                          is_headless;
 };
 
 typedef enum {
@@ -206,6 +209,7 @@ static bool alloc(VkPhysicalDevice physical_device, VkDevice device,
   return true;
 }
 
+#ifndef VIK_HEADLESS
 static bool make_depth_image_and_view(VkPhysicalDevice physical_device, VkDevice device,
                                       VkExtent2D extent, VkImage *out_image,
                                       VkDeviceMemory *out_memory,
@@ -782,6 +786,177 @@ VikInstance *vik_make_instance(WinxWindow *window,
   result->has_compute = false;
   result->was_compute_used_in_this_frame = false;
   result->has_depth = enable_depth;
+  result->is_headless = false;
+  return result;
+}
+#endif
+
+VikInstance *vik_make_headless_instance(VikRequestFlags request) {
+  VkApplicationInfo app_info = {0};
+  app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+  app_info.pApplicationName = APP_NAME;
+  app_info.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
+  app_info.pEngineName = ENGINE_NAME;
+  app_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+  app_info.apiVersion = VK_API_VERSION_1_0;
+
+#ifdef VIK_NDEBUG
+  const char *layers[] = {};
+#else
+  const char *layers[] = { "VK_LAYER_KHRONOS_validation" };
+#endif
+
+  VkInstanceCreateInfo instance_create_info = {0};
+  instance_create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+  instance_create_info.pApplicationInfo = &app_info;
+  instance_create_info.enabledExtensionCount = 0;
+  instance_create_info.ppEnabledExtensionNames = NULL;
+  instance_create_info.enabledLayerCount = ARRAY_LEN(layers);
+  instance_create_info.ppEnabledLayerNames = layers;
+
+  VkInstance instance;
+  VkResult instance_result = vkCreateInstance(&instance_create_info, NULL, &instance);
+  if (instance_result != VK_SUCCESS) {
+    sprintf(error_buffer, "Failed to create Vulkan instance: %s",
+            vk_result_to_cstr(instance_result));
+    return NULL;
+  }
+
+  u32 physical_devices_len;
+  vkEnumeratePhysicalDevices(instance, &physical_devices_len, NULL);
+
+  if (physical_devices_len == 0) {
+    sprintf(error_buffer, "No GPUs supporting Vulkan were found");
+    return NULL;
+  }
+
+  VkPhysicalDevice *physical_devices = malloc(physical_devices_len * sizeof(*physical_devices));
+  vkEnumeratePhysicalDevices(instance, &physical_devices_len, physical_devices);
+
+  // TODO: allow library user to select a physical device
+  VkPhysicalDevice physical_device;
+  bool found_suitable_physical_device = false;
+  u32 graphics_queue_family_index;
+
+  for (u32 i = 0; i < 1; ++i) {
+    for (u32 j = 0; j < physical_devices_len; ++j) {
+      VkPhysicalDeviceProperties device_props;
+      vkGetPhysicalDeviceProperties(physical_devices[j], &device_props);
+
+      VkPhysicalDeviceFeatures device_features;
+      vkGetPhysicalDeviceFeatures(physical_devices[j], &device_features);
+
+      if (device_props.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU &&
+          i == 0)
+        continue;
+
+      graphics_queue_family_index = (u32) -1;
+
+      u32 queue_family_props_len;
+      vkGetPhysicalDeviceQueueFamilyProperties(physical_devices[j], &queue_family_props_len, NULL);
+
+      VkQueueFamilyProperties *queue_family_props = malloc(queue_family_props_len * sizeof (*queue_family_props));
+      vkGetPhysicalDeviceQueueFamilyProperties(physical_devices[j], &queue_family_props_len, queue_family_props);
+
+      for (u32 k = 0; k < queue_family_props_len; ++k) {
+        if ((queue_family_props[k].queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
+            (((request & VikRequestFlagsCompute) == 0) ||
+             (queue_family_props[k].queueFlags & VK_QUEUE_COMPUTE_BIT))) {
+          graphics_queue_family_index = k;
+          break;
+        }
+
+        if (graphics_queue_family_index != (u32) -1)
+          break;
+      }
+
+      if (queue_family_props)
+        free(queue_family_props);
+
+      // TODO: also check for swapchain capabilites here
+      if (graphics_queue_family_index != (u32) -1 &&
+          ((request & VikRequestFlagsGeometry) == 0 ||
+           device_features.geometryShader)) {
+        physical_device = physical_devices[j];
+        found_suitable_physical_device = true;
+      }
+    }
+
+    if (found_suitable_physical_device)
+      break;
+  }
+
+  free(physical_devices);
+
+  if (!found_suitable_physical_device) {
+    sprintf(error_buffer, "No suitable GPUs were found");
+    return NULL;
+  }
+
+  float priority = 1.0f;
+  u32 queue_create_infos_len;
+  VkDeviceQueueCreateInfo *queue_create_infos;
+
+  queue_create_infos_len = 1;
+  queue_create_infos = malloc(queue_create_infos_len * sizeof(*queue_create_infos));
+  memset(queue_create_infos, 0, queue_create_infos_len * sizeof(*queue_create_infos));
+  queue_create_infos[0].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+  queue_create_infos[0].queueFamilyIndex = graphics_queue_family_index;
+  queue_create_infos[0].queueCount = 1;
+  queue_create_infos[0].pQueuePriorities = &priority;
+
+  const char *device_extensions[] = {};
+
+  VkPhysicalDeviceFeatures device_features = {0};
+  device_features.samplerAnisotropy = VK_TRUE;
+  device_features.vertexPipelineStoresAndAtomics = VK_TRUE;
+  if (request & VikRequestFlagsGeometry)
+    device_features.geometryShader = VK_TRUE;
+
+  VkDeviceCreateInfo device_create_info = {0};
+  device_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+  device_create_info.pQueueCreateInfos = queue_create_infos;
+  device_create_info.queueCreateInfoCount = queue_create_infos_len;
+  device_create_info.enabledExtensionCount = ARRAY_LEN(device_extensions);
+  device_create_info.ppEnabledExtensionNames = device_extensions;
+  device_create_info.pEnabledFeatures = &device_features;
+
+  VkDevice device;
+  VkResult device_result = vkCreateDevice(physical_device, &device_create_info, NULL, &device);
+  if (device_result != VK_SUCCESS) {
+    sprintf(error_buffer, "Failed to create logical Vulkan device: %s",
+            vk_result_to_cstr(device_result));
+    return NULL;
+  }
+
+  free(queue_create_infos);
+
+  VkQueue compute_queue;
+  if (request & VikRequestFlagsCompute)
+    vkGetDeviceQueue(device, graphics_queue_family_index, 0, &compute_queue);
+
+  VkCommandPoolCreateInfo command_pool_create_info = {0};
+  command_pool_create_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+  command_pool_create_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+  command_pool_create_info.queueFamilyIndex = graphics_queue_family_index;
+
+  VkCommandPool command_pool;
+  VkResult command_pool_result = vkCreateCommandPool(device, &command_pool_create_info, NULL, &command_pool);
+  if (command_pool_result != VK_SUCCESS) {
+    sprintf(error_buffer, "Failed to create temporary Vulkan command pool: %s",
+            vk_result_to_cstr(command_pool_result));
+    return NULL;
+  }
+
+  VikInstance *result = malloc(sizeof(*result));
+  result->instance = instance;
+  result->physical_device = physical_device;
+  result->graphics_queue_family_index = graphics_queue_family_index;
+  result->device = device;
+  result->compute_queue = compute_queue;
+  result->temp_pool = command_pool;
+  result->has_compute = false;
+  result->is_headless = true;
   return result;
 }
 
@@ -1820,6 +1995,7 @@ VikImage *vik_make_image_ex(VikInstance *instance, void *data,
   return result;
 }
 
+#ifndef VIK_HEADLESS
 bool vik_begin_frame(VikExecutor *executor, f32 r, f32 g, f32 b, f32 a) {
   VikInstance *instance = executor->instance;
 
@@ -2001,6 +2177,7 @@ bool vik_end_frame(VikExecutor *executor) {
 
   return true;
 }
+#endif
 
 bool vik_begin_compute_frame(VikExecutor *executor) {
   VikInstance *instance = executor->instance;
@@ -2084,12 +2261,14 @@ void vik_cmd_use_pipeline(VikExecutor *executor, VikPipeline *pipeline) {
   }
 }
 
+#ifndef VIK_HEADLESS
 void vik_cmd_draw(VikExecutor *executor, VikMesh *mesh, u32 instances_len) {
   VkDeviceSize offset = 0;
   vkCmdBindVertexBuffers(executor->buffer, 0, 1, &mesh->vertex_buffer, &offset);
   vkCmdBindIndexBuffer(executor->buffer, mesh->index_buffer, 0, VK_INDEX_TYPE_UINT32);
   vkCmdDrawIndexed(executor->buffer, mesh->indices_len, instances_len, 0, 0, 0);
 }
+#endif
 
 void vik_cmd_compute(VikExecutor *executor, u32 groups_x, u32 groups_y, u32 groups_z) {
   vkCmdDispatch(executor->buffer, groups_x, groups_y, groups_z);
@@ -2117,33 +2296,39 @@ void vik_delete_instance(VikInstance *instance) {
 
   vkDestroyCommandPool(instance->device, instance->temp_pool, NULL);
 
-  vkDestroyFence(instance->device, instance->in_flight_fence, NULL);
-  for (u32 i = 0; i < instance->resources.images_len; ++i)
-    vkDestroySemaphore(instance->device, instance->render_finished_semaphores[i], NULL);
-  vkDestroySemaphore(instance->device, instance->image_available_semaphore, NULL);
-  if (instance->has_compute)
-    vkDestroySemaphore(instance->device, instance->compute_finished_semaphore, NULL);
+  if (!instance->is_headless) {
+    vkDestroyFence(instance->device, instance->in_flight_fence, NULL);
+    for (u32 i = 0; i < instance->resources.images_len; ++i)
+      vkDestroySemaphore(instance->device, instance->render_finished_semaphores[i], NULL);
+    vkDestroySemaphore(instance->device, instance->image_available_semaphore, NULL);
+    if (instance->has_compute)
+      vkDestroySemaphore(instance->device, instance->compute_finished_semaphore, NULL);
 
-  free(instance->render_finished_semaphores);
+    free(instance->render_finished_semaphores);
 
-  if (instance->has_depth) {
-    vkDestroyImageView(instance->device, instance->resources.depth_image_view, NULL);
-    vkDestroyImage(instance->device, instance->resources.depth_image, NULL);
-    vkFreeMemory(instance->device, instance->resources.depth_image_memory, NULL);
+    if (instance->has_depth) {
+      vkDestroyImageView(instance->device, instance->resources.depth_image_view, NULL);
+      vkDestroyImage(instance->device, instance->resources.depth_image, NULL);
+      vkFreeMemory(instance->device, instance->resources.depth_image_memory, NULL);
+    }
+    for (u32 i = 0; i < instance->resources.images_len; ++i)
+      vkDestroyFramebuffer(instance->device, instance->resources.framebuffers[i], NULL);
+
+    vkDestroyRenderPass(instance->device, instance->render_pass, NULL);
+
+#ifndef VIK_HEADLESS
+    delete_window_size_dependant_resources(&instance->resources, instance->device);
+#endif
   }
-  for (u32 i = 0; i < instance->resources.images_len; ++i)
-    vkDestroyFramebuffer(instance->device, instance->resources.framebuffers[i], NULL);
-
-  vkDestroyRenderPass(instance->device, instance->render_pass, NULL);
-
-  delete_window_size_dependant_resources(&instance->resources, instance->device);
 
   vkDestroyDevice(instance->device, NULL);
-  vkDestroySurfaceKHR(instance->instance, instance->surface, NULL);
+  if (!instance->is_headless)
+    vkDestroySurfaceKHR(instance->instance, instance->surface, NULL);
   vkDestroyInstance(instance->instance, NULL);
 
-  if (instance->resources.framebuffers)
-    free(instance->resources.framebuffers);
+  if (!instance->is_headless)
+    if (instance->resources.framebuffers)
+      free(instance->resources.framebuffers);
   free(instance);
 }
 
