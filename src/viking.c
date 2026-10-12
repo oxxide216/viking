@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <vulkan/vulkan.h>
 
 #include "viking/viking.h"
@@ -1167,7 +1168,9 @@ static VkBufferUsageFlagBits get_vulkan_buffer_usage_for_buffer_kind(VikBufferKi
   return 0;
 }
 
-VikBuffer *vik_make_buffer(VikInstance *instance, u32 size, VikBufferKind kind) {
+VikBuffer *vik_make_buffer(VikInstance *instance, u32 size,
+                           VikBufferKind kind,
+                           VikBufferAccess access) {
   VkBuffer buffer;
   VkDeviceMemory buffer_memory;
   if (!make_buffer(instance->physical_device, instance->device,
@@ -1177,8 +1180,11 @@ VikBuffer *vik_make_buffer(VikInstance *instance, u32 size, VikBufferKind kind) 
                    &buffer, &buffer_memory))
     return NULL;
 
-  void *data;
-  vkMapMemory(instance->device, buffer_memory, 0, size, 0, &data);
+  assert(access != VikBufferAccessStaging);
+
+  void *data = NULL;
+  if (access == VikBufferAccessCPU)
+    vkMapMemory(instance->device, buffer_memory, 0, size, 0, &data);
 
   VikBuffer *result = malloc(sizeof(*result));
   result->instance = instance;

@@ -55,6 +55,12 @@ typedef enum {
 } VikBufferKind;
 
 typedef enum {
+  VikBufferAccessCPU = 0,
+  VikBufferAccessStaging,
+  VikBufferAccessGPU,
+} VikBufferAccess;
+
+typedef enum {
   VikImageFormatR8 = 0,
   VikImageFormatRG8,
   VikImageFormatRGB8,
@@ -79,7 +85,9 @@ VikShader   *vik_make_shader_vgf(VikInstance *instance, Str vertex_bc,
                                  Str geometry_bc, Str fragment_bc);
 // "c" stands for compute and "bc" stands for bytecode
 VikShader   *vik_make_shader_c(VikInstance *instance, Str compute_bc);
-VikBuffer   *vik_make_buffer(VikInstance *instance, u32 size, VikBufferKind kind);
+VikBuffer   *vik_make_buffer(VikInstance *instance, u32 size,
+                             VikBufferKind kind,
+                             VikBufferAccess access);
 VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
                                VikAttr *attrs, u32 attrs_len,
                                VikBuffer **buffers, u32 buffers_len,
