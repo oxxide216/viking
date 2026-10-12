@@ -2249,7 +2249,11 @@ bool vik_end_compute_frame(VikExecutor *executor) {
   submit_info.signalSemaphoreCount = 1;
   submit_info.pSignalSemaphores = &instance->compute_finished_semaphore;
 
-  VkResult submit_result = vkQueueSubmit(instance->graphics_queue, 1, &submit_info, VK_NULL_HANDLE);
+  VkResult submit_result;
+  if (instance->is_headless)
+    submit_result = vkQueueSubmit(instance->graphics_queue, 1, &submit_info, instance->in_flight_fence);
+  else
+    submit_result = vkQueueSubmit(instance->graphics_queue, 1, &submit_info, VK_NULL_HANDLE);
   if (submit_result != VK_SUCCESS) {
     sprintf(error_buffer, "Failed to submit compute command: %s",
             vk_result_to_cstr(submit_result));
