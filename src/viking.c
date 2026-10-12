@@ -942,8 +942,8 @@ VikInstance *vik_make_headless_instance(VikRequestFlags request) {
   fence_create_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
   fence_create_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
-  VkResult = sync_result = vkCreateFence(device, &fence_create_info,
-                                         NULL, &in_flight_fence);
+  VkResult sync_result = vkCreateFence(device, &fence_create_info,
+                                       NULL, &in_flight_fence);
   if (sync_result != VK_SUCCESS) {
     sprintf(error_buffer, "Failed to create Vulkan syncronization primitives: %s",
             vk_result_to_cstr(sync_result));
