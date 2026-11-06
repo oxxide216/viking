@@ -2034,9 +2034,11 @@ bool vik_begin_frame(VikExecutor *executor, f32 r, f32 g, f32 b, f32 a) {
   if (acquire_result == VK_ERROR_OUT_OF_DATE_KHR || acquire_result == VK_SUBOPTIMAL_KHR) {
     vkDeviceWaitIdle(instance->device);
 
-    vkDestroyImageView(instance->device, instance->resources.depth_image_view, NULL);
-    vkDestroyImage(instance->device, instance->resources.depth_image, NULL);
-    vkFreeMemory(instance->device, instance->resources.depth_image_memory, NULL);
+    if (instance->has_depth) {
+      vkDestroyImageView(instance->device, instance->resources.depth_image_view, NULL);
+      vkDestroyImage(instance->device, instance->resources.depth_image, NULL);
+      vkFreeMemory(instance->device, instance->resources.depth_image_memory, NULL);
+    }
 
     for (u32 i = 0; i < instance->resources.images_len; ++i)
       vkDestroyFramebuffer(instance->device, instance->resources.framebuffers[i], NULL);
