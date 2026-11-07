@@ -62,10 +62,10 @@ $(BUILD_DIR)/tests/%.exe: tests/%.c libviking.lib libs/winx/libwinx.lib
 > $(CC) $(CFLAGS) -o $@ $< libviking.lib libs/winx/libwinx.lib $(LDFLAGS)
 
 libs/winx/libwinx.a:
-> $(MAKE) -C libs/winx -B
+> $(MAKE) CFLAGS=-DWINX_VULKAN -C libs/winx -B
 
 libs/winx/libwinx.lib:
-> $(MAKE) -C libs/winx -B
+> $(MAKE) CFLAGS=-DWINX_VULKAN -C libs/winx -B
 
 clean:
 > rm -rf $(BUILD_DIR) libviking.a libviking.lib
