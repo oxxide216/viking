@@ -6,6 +6,10 @@
 #define APP_NAME    "Viking Application"
 #define ENGINE_NAME "Viking Engine"
 
+#ifndef FRAMES_IN_FLIGHT
+#define FRAMES_IN_FLIGHT 3
+#endif
+
 typedef struct {
   VkExtent2D          extent;
   VkSurfaceFormatKHR  format;
@@ -13,9 +17,9 @@ typedef struct {
   u32                 images_len;
   VkImage            *images;
   VkImageView        *image_views;
-  VkImage             depth_image;
-  VkDeviceMemory      depth_image_memory;
-  VkImageView         depth_image_view;
+  VkImage             depth_images[FRAMES_IN_FLIGHT];
+  VkDeviceMemory      depth_image_memories[FRAMES_IN_FLIGHT];
+  VkImageView         depth_image_views[FRAMES_IN_FLIGHT];
   VkFramebuffer      *framebuffers;
 } WindowSizeDependantResources;
 
@@ -40,9 +44,10 @@ struct VikInstance {
   VkSemaphore                   image_available_semaphore;
   VkSemaphore                  *render_finished_semaphores;
   VkSemaphore                   compute_finished_semaphore;
-  VkFence                       in_flight_fence;
+  VkFence                       in_flight_fences[FRAMES_IN_FLIGHT];
   VkCommandPool                 temp_pool;
   u32                           image_index;
+  u32                           frame_index;
   bool                          has_compute;
   bool                          was_compute_used_in_this_frame;
   bool                          has_depth;
@@ -88,7 +93,7 @@ struct VikPipeline {
 struct VikExecutor {
   VikInstance     *instance;
   VkCommandPool    pool;
-  VkCommandBuffer  buffer;
+  VkCommandBuffer  buffers[FRAMES_IN_FLIGHT];
 };
 
 struct VikMesh {
@@ -212,10 +217,10 @@ static bool alloc(VkPhysicalDevice physical_device, VkDevice device,
 }
 
 #ifndef VIK_HEADLESS
-static bool make_depth_image_and_view(VkPhysicalDevice physical_device, VkDevice device,
-                                      VkExtent2D extent, VkImage *out_image,
-                                      VkDeviceMemory *out_memory,
-                                      VkImageView *out_image_view) {
+static bool make_depth_images_and_views(VkPhysicalDevice physical_device, VkDevice device,
+                                        VkExtent2D extent, VkImage *out_images,
+                                        VkDeviceMemory *out_memories,
+                                        VkImageView *out_image_views) {
   VkImageCreateInfo depth_image_create_info = {0};
   depth_image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
   depth_image_create_info.imageType = VK_IMAGE_TYPE_2D;
@@ -231,40 +236,42 @@ static bool make_depth_image_and_view(VkPhysicalDevice physical_device, VkDevice
   depth_image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
   depth_image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-  VkResult depth_image_result = vkCreateImage(device, &depth_image_create_info, NULL, out_image);
-  if (depth_image_result != VK_SUCCESS) {
-    sprintf(error_buffer, "Failed to create Vulkan image: %s",
-            vk_result_to_cstr(depth_image_result));
-    return false;
-  }
+  for (u32 i = 0; i < FRAMES_IN_FLIGHT; ++i) {
+    VkResult depth_image_result = vkCreateImage(device, &depth_image_create_info, NULL, out_images + i);
+    if (depth_image_result != VK_SUCCESS) {
+      sprintf(error_buffer, "Failed to create Vulkan image: %s",
+              vk_result_to_cstr(depth_image_result));
+      return false;
+    }
 
-  VkMemoryRequirements reqs;
-  vkGetImageMemoryRequirements(device, *out_image, &reqs);
+    VkMemoryRequirements reqs;
+    vkGetImageMemoryRequirements(device, out_images[i], &reqs);
 
-  if (!alloc(physical_device, device,
-             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, reqs, out_memory))
-    return false;
+    if (!alloc(physical_device, device,
+               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, reqs, out_memories + i))
+      return false;
 
-  vkBindImageMemory(device, *out_image, *out_memory, 0);
+    vkBindImageMemory(device, out_images[i], out_memories[i], 0);
 
-  VkImageViewCreateInfo depth_image_view_create_info = {0};
-  depth_image_view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-  depth_image_view_create_info.image = *out_image;
-  depth_image_view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-  depth_image_view_create_info.format = depth_image_create_info.format;
-  depth_image_view_create_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-  depth_image_view_create_info.subresourceRange.baseMipLevel = 0;
-  depth_image_view_create_info.subresourceRange.levelCount = 1;
-  depth_image_view_create_info.subresourceRange.baseArrayLayer = 0;
-  depth_image_view_create_info.subresourceRange.layerCount = 1;
+    VkImageViewCreateInfo depth_image_view_create_info = {0};
+    depth_image_view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    depth_image_view_create_info.image = out_images[i];
+    depth_image_view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    depth_image_view_create_info.format = depth_image_create_info.format;
+    depth_image_view_create_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    depth_image_view_create_info.subresourceRange.baseMipLevel = 0;
+    depth_image_view_create_info.subresourceRange.levelCount = 1;
+    depth_image_view_create_info.subresourceRange.baseArrayLayer = 0;
+    depth_image_view_create_info.subresourceRange.layerCount = 1;
 
-  VkResult depth_image_view_result = vkCreateImageView(device,
-                                                       &depth_image_view_create_info,
-                                                       NULL, out_image_view);
-  if (depth_image_view_result != VK_SUCCESS) {
-    sprintf(error_buffer, "Failed to create Vulkan image view: %s",
-            vk_result_to_cstr(depth_image_view_result));
-    return false;
+    VkResult depth_image_view_result = vkCreateImageView(device,
+                                                         &depth_image_view_create_info,
+                                                         NULL, out_image_views + i);
+    if (depth_image_view_result != VK_SUCCESS) {
+      sprintf(error_buffer, "Failed to create Vulkan image view: %s",
+              vk_result_to_cstr(depth_image_view_result));
+      return false;
+    }
   }
 
   return true;
@@ -390,10 +397,10 @@ static bool make_window_size_dependant_resources_except_framebuffers(WindowSizeD
   }
 
   if (enable_depth)
-    if (!make_depth_image_and_view(physical_device, device,
-                                   result->extent, &result->depth_image,
-                                   &result->depth_image_memory,
-                                   &result->depth_image_view))
+    if (!make_depth_images_and_views(physical_device, device,
+                                     result->extent, result->depth_images,
+                                     result->depth_image_memories,
+                                     result->depth_image_views))
       return false;
 
   return true;
@@ -405,7 +412,7 @@ static bool make_framebuffers(WindowSizeDependantResources *resources,
   for (u32 i = 0; i < resources->images_len; ++i) {
     VkImageView attachments[2] = {
       resources->image_views[i],
-      resources->depth_image_view,
+      resources->depth_image_views[0],
     };
 
     VkFramebufferCreateInfo framebuffer_create_info = {0};
@@ -721,7 +728,7 @@ VikInstance *vik_make_instance(WinxWindow *window,
 
   VkSemaphore image_available_semaphore;
   VkSemaphore *render_finished_semaphores = malloc(resources.images_len * sizeof(*render_finished_semaphores));
-  VkFence in_flight_fence;
+  VkFence in_flight_fences[FRAMES_IN_FLIGHT];
 
   VkSemaphoreCreateInfo semaphore_create_info = {0};
   semaphore_create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
@@ -739,11 +746,13 @@ VikInstance *vik_make_instance(WinxWindow *window,
     return NULL;
   }
 
-  sync_result = vkCreateFence(device, &fence_create_info, NULL, &in_flight_fence);
-  if (sync_result != VK_SUCCESS) {
-    sprintf(error_buffer, "Failed to create Vulkan syncronization primitives: %s",
-            vk_result_to_cstr(sync_result));
-    return NULL;
+  for (u32 i = 0; i < FRAMES_IN_FLIGHT; ++i) {
+    sync_result = vkCreateFence(device, &fence_create_info, NULL, in_flight_fences + i);
+    if (sync_result != VK_SUCCESS) {
+      sprintf(error_buffer, "Failed to create Vulkan syncronization primitives: %s",
+              vk_result_to_cstr(sync_result));
+      return NULL;
+    }
   }
 
   for (u32 i = 0; i < resources.images_len; ++i) {
@@ -783,8 +792,10 @@ VikInstance *vik_make_instance(WinxWindow *window,
   result->render_pass = render_pass;
   result->image_available_semaphore = image_available_semaphore;
   result->render_finished_semaphores = render_finished_semaphores;
-  result->in_flight_fence = in_flight_fence;
+  memcpy(result->in_flight_fences, in_flight_fences, sizeof(in_flight_fences));
   result->temp_pool = command_pool;
+  result->image_index = 0;
+  result->frame_index = 0;
   result->has_compute = false;
   result->was_compute_used_in_this_frame = false;
   result->has_depth = enable_depth;
@@ -937,18 +948,20 @@ VikInstance *vik_make_headless_instance(VikRequestFlags request) {
   if (request & VikRequestFlagsCompute)
     vkGetDeviceQueue(device, graphics_queue_family_index, 0, &compute_queue);
 
-  VkFence in_flight_fence;
+  VkFence in_flight_fences[FRAMES_IN_FLIGHT];
   VkFenceCreateInfo fence_create_info = {0};
 
   fence_create_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
   fence_create_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
-  VkResult sync_result = vkCreateFence(device, &fence_create_info,
-                                       NULL, &in_flight_fence);
-  if (sync_result != VK_SUCCESS) {
-    sprintf(error_buffer, "Failed to create Vulkan syncronization primitives: %s",
-            vk_result_to_cstr(sync_result));
-    return NULL;
+  for (u32 i = 0; i < FRAMES_IN_FLIGHT; ++i) {
+    VkResult sync_result = vkCreateFence(device, &fence_create_info,
+                                         NULL, in_flight_fences + i);
+    if (sync_result != VK_SUCCESS) {
+      sprintf(error_buffer, "Failed to create Vulkan syncronization primitives: %s",
+              vk_result_to_cstr(sync_result));
+      return NULL;
+    }
   }
 
   VkCommandPoolCreateInfo command_pool_create_info = {0};
@@ -970,7 +983,7 @@ VikInstance *vik_make_headless_instance(VikRequestFlags request) {
   result->graphics_queue_family_index = graphics_queue_family_index;
   result->device = device;
   result->compute_queue = compute_queue;
-  result->in_flight_fence = in_flight_fence;
+  memcpy(result->in_flight_fences, in_flight_fences, sizeof(in_flight_fences));
   result->temp_pool = command_pool;
   result->has_compute = false;
   result->is_headless = true;
@@ -1730,18 +1743,20 @@ VikExecutor *vik_make_executor(VikInstance *instance) {
   command_buffer_alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
   command_buffer_alloc_info.commandBufferCount = 1;
 
-  VkCommandBuffer command_buffer;
-  VkResult command_buffer_result = vkAllocateCommandBuffers(instance->device, &command_buffer_alloc_info, &command_buffer);
-  if (command_buffer_result != VK_SUCCESS) {
-    sprintf(error_buffer, "Failed to create Vulkan command buffer: %s",
-            vk_result_to_cstr(command_buffer_result));
-    return NULL;
+  VkCommandBuffer command_buffers[FRAMES_IN_FLIGHT];
+  for (u32 i = 0; i < FRAMES_IN_FLIGHT; ++i) {
+    VkResult command_buffer_result = vkAllocateCommandBuffers(instance->device, &command_buffer_alloc_info, command_buffers + i);
+    if (command_buffer_result != VK_SUCCESS) {
+      sprintf(error_buffer, "Failed to create Vulkan command buffer: %s",
+              vk_result_to_cstr(command_buffer_result));
+      return NULL;
+    }
   }
 
   VikExecutor *result = malloc(sizeof(*result));
   result->instance = instance;
   result->pool = command_pool;
-  result->buffer = command_buffer;
+  memcpy(result->buffers, command_buffers, sizeof(command_buffers));
   return result;
 }
 
@@ -2024,7 +2039,9 @@ VikImage *vik_make_image_ex(VikInstance *instance, void *data,
 bool vik_begin_frame(VikExecutor *executor, f32 r, f32 g, f32 b, f32 a) {
   VikInstance *instance = executor->instance;
 
-  vkWaitForFences(instance->device, 1, &instance->in_flight_fence, VK_TRUE, UINT64_MAX);
+  vkWaitForFences(instance->device, 1,
+                  instance->in_flight_fences + instance->frame_index,
+                  VK_TRUE, UINT64_MAX);
 
   VkResult acquire_result = vkAcquireNextImageKHR(instance->device,
                                                   instance->resources.swap_chain,
@@ -2035,9 +2052,11 @@ bool vik_begin_frame(VikExecutor *executor, f32 r, f32 g, f32 b, f32 a) {
     vkDeviceWaitIdle(instance->device);
 
     if (instance->has_depth) {
-      vkDestroyImageView(instance->device, instance->resources.depth_image_view, NULL);
-      vkDestroyImage(instance->device, instance->resources.depth_image, NULL);
-      vkFreeMemory(instance->device, instance->resources.depth_image_memory, NULL);
+      for (u32 i = 0; i < FRAMES_IN_FLIGHT; ++i) {
+        vkDestroyImageView(instance->device, instance->resources.depth_image_views[i], NULL);
+        vkDestroyImage(instance->device, instance->resources.depth_images[i], NULL);
+        vkFreeMemory(instance->device, instance->resources.depth_image_memories[i], NULL);
+      }
     }
 
     for (u32 i = 0; i < instance->resources.images_len; ++i)
@@ -2075,16 +2094,16 @@ bool vik_begin_frame(VikExecutor *executor, f32 r, f32 g, f32 b, f32 a) {
     return false;
   }
 
-  vkResetFences(instance->device, 1, &instance->in_flight_fence);
+  vkResetFences(instance->device, 1, instance->in_flight_fences + instance->frame_index);
 
-  vkResetCommandBuffer(executor->buffer, 0);
+  vkResetCommandBuffer(executor->buffers[instance->frame_index], 0);
 
   VkCommandBufferBeginInfo command_buffer_begin_info = {0};
   command_buffer_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
   command_buffer_begin_info.flags = 0; // Optional
   command_buffer_begin_info.pInheritanceInfo = NULL; // Optional
 
-  VkResult begin_result = vkBeginCommandBuffer(executor->buffer, &command_buffer_begin_info);
+  VkResult begin_result = vkBeginCommandBuffer(executor->buffers[instance->frame_index], &command_buffer_begin_info);
   if (begin_result != VK_SUCCESS) {
     sprintf(error_buffer, "Failed to begin recording Vulkan command buffer: %s",
             vk_result_to_cstr(begin_result));
@@ -2105,7 +2124,8 @@ bool vik_begin_frame(VikExecutor *executor, f32 r, f32 g, f32 b, f32 a) {
   render_pass_begin_info.clearValueCount = ARRAY_LEN(clear_values);
   render_pass_begin_info.pClearValues = clear_values;
 
-  vkCmdBeginRenderPass(executor->buffer, &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
+  vkCmdBeginRenderPass(executor->buffers[instance->frame_index],
+                       &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
 
   return true;
 }
@@ -2113,9 +2133,9 @@ bool vik_begin_frame(VikExecutor *executor, f32 r, f32 g, f32 b, f32 a) {
 bool vik_end_frame(VikExecutor *executor) {
   VikInstance *instance = executor->instance;
 
-  vkCmdEndRenderPass(executor->buffer);
+  vkCmdEndRenderPass(executor->buffers[instance->frame_index]);
 
-  VkResult end_result = vkEndCommandBuffer(executor->buffer);
+  VkResult end_result = vkEndCommandBuffer(executor->buffers[instance->frame_index]);
   if (end_result != VK_SUCCESS) {
     sprintf(error_buffer, "Failed to end recording Vulkan command buffer: %s",
             vk_result_to_cstr(end_result));
@@ -2136,13 +2156,13 @@ bool vik_end_frame(VikExecutor *executor) {
   submit_info.pWaitSemaphores = wait_semaphores;
   submit_info.pWaitDstStageMask = wait_stages;
   submit_info.commandBufferCount = 1;
-  submit_info.pCommandBuffers = &executor->buffer;
+  submit_info.pCommandBuffers = executor->buffers + instance->frame_index;
   submit_info.signalSemaphoreCount = 1;
   submit_info.pSignalSemaphores = instance->render_finished_semaphores + instance->image_index;
 
   instance->was_compute_used_in_this_frame = false;
 
-  VkResult submit_result = vkQueueSubmit(instance->graphics_queue, 1, &submit_info, instance->in_flight_fence);
+  VkResult submit_result = vkQueueSubmit(instance->graphics_queue, 1, &submit_info, instance->in_flight_fences[instance->frame_index]);
   if (submit_result != VK_SUCCESS) {
     sprintf(error_buffer, "Failed to submit draw command: %s",
             vk_result_to_cstr(submit_result));
@@ -2162,9 +2182,11 @@ bool vik_end_frame(VikExecutor *executor) {
     vkDeviceWaitIdle(instance->device);
 
     if (instance->has_depth) {
-      vkDestroyImageView(instance->device, instance->resources.depth_image_view, NULL);
-      vkDestroyImage(instance->device, instance->resources.depth_image, NULL);
-      vkFreeMemory(instance->device, instance->resources.depth_image_memory, NULL);
+      for (u32 i = 0; i < FRAMES_IN_FLIGHT; ++i) {
+        vkDestroyImageView(instance->device, instance->resources.depth_image_views[i], NULL);
+        vkDestroyImage(instance->device, instance->resources.depth_images[i], NULL);
+        vkFreeMemory(instance->device, instance->resources.depth_image_memories[i], NULL);
+      }
     }
 
     for (u32 i = 0; i < instance->resources.images_len; ++i)
@@ -2202,6 +2224,8 @@ bool vik_end_frame(VikExecutor *executor) {
     return false;
   }
 
+  instance->frame_index = (instance->frame_index + 1) % FRAMES_IN_FLIGHT;
+
   return true;
 }
 #endif
@@ -2211,16 +2235,18 @@ bool vik_begin_compute_frame(VikExecutor *executor) {
 
   instance->was_compute_used_in_this_frame = true;
 
-  vkWaitForFences(instance->device, 1, &instance->in_flight_fence, VK_TRUE, UINT64_MAX);
+  vkWaitForFences(instance->device, 1,
+                  instance->in_flight_fences + instance->frame_index,
+                  VK_TRUE, UINT64_MAX);
 
-  vkResetCommandBuffer(executor->buffer, 0);
+  vkResetCommandBuffer(executor->buffers[instance->frame_index], 0);
 
   VkCommandBufferBeginInfo command_buffer_begin_info = {0};
   command_buffer_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
   command_buffer_begin_info.flags = 0; // Optional
   command_buffer_begin_info.pInheritanceInfo = NULL; // Optional
 
-  VkResult begin_result = vkBeginCommandBuffer(executor->buffer, &command_buffer_begin_info);
+  VkResult begin_result = vkBeginCommandBuffer(executor->buffers[instance->frame_index], &command_buffer_begin_info);
   if (begin_result != VK_SUCCESS) {
     sprintf(error_buffer, "Failed to begin recording Vulkan command buffer: %s",
             vk_result_to_cstr(begin_result));
@@ -2233,7 +2259,7 @@ bool vik_begin_compute_frame(VikExecutor *executor) {
 bool vik_end_compute_frame(VikExecutor *executor) {
   VikInstance *instance = executor->instance;
 
-  VkResult end_result = vkEndCommandBuffer(executor->buffer);
+  VkResult end_result = vkEndCommandBuffer(executor->buffers[instance->frame_index]);
   if (end_result != VK_SUCCESS) {
     sprintf(error_buffer, "Failed to end recording Vulkan command buffer: %s",
             vk_result_to_cstr(end_result));
@@ -2243,13 +2269,13 @@ bool vik_end_compute_frame(VikExecutor *executor) {
   VkSubmitInfo submit_info = {0};
   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   submit_info.commandBufferCount = 1;
-  submit_info.pCommandBuffers = &executor->buffer;
+  submit_info.pCommandBuffers = executor->buffers + instance->frame_index;
   submit_info.signalSemaphoreCount = 1;
   submit_info.pSignalSemaphores = &instance->compute_finished_semaphore;
 
   VkResult submit_result;
   if (instance->is_headless)
-    submit_result = vkQueueSubmit(instance->graphics_queue, 1, &submit_info, instance->in_flight_fence);
+    submit_result = vkQueueSubmit(instance->graphics_queue, 1, &submit_info, instance->in_flight_fences[instance->frame_index]);
   else
     submit_result = vkQueueSubmit(instance->graphics_queue, 1, &submit_info, VK_NULL_HANDLE);
   if (submit_result != VK_SUCCESS) {
@@ -2269,9 +2295,11 @@ void vik_cmd_use_pipeline(VikExecutor *executor, VikPipeline *pipeline) {
     VK_PIPELINE_BIND_POINT_COMPUTE :
     VK_PIPELINE_BIND_POINT_GRAPHICS;
 
-  vkCmdBindPipeline(executor->buffer, bind_point, pipeline->pipeline);
+  VkCommandBuffer buffer = executor->buffers[instance->frame_index];
+
+  vkCmdBindPipeline(buffer, bind_point, pipeline->pipeline);
   if (pipeline->descriptor_set != VK_NULL_HANDLE)
-    vkCmdBindDescriptorSets(executor->buffer, bind_point, pipeline->layout, 0, 1, &pipeline->descriptor_set, 0, NULL);
+    vkCmdBindDescriptorSets(buffer, bind_point, pipeline->layout, 0, 1, &pipeline->descriptor_set, 0, NULL);
 
   if (!pipeline->is_compute) {
     VkViewport viewport = {0};
@@ -2282,27 +2310,27 @@ void vik_cmd_use_pipeline(VikExecutor *executor, VikPipeline *pipeline) {
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
 
-    vkCmdSetViewport(executor->buffer, 0, 1, &viewport);
+    vkCmdSetViewport(buffer, 0, 1, &viewport);
 
     VkRect2D scissor = {0};
     scissor.offset = (VkOffset2D) { 0, 0 };
     scissor.extent = instance->resources.extent;
 
-    vkCmdSetScissor(executor->buffer, 0, 1, &scissor);
+    vkCmdSetScissor(buffer, 0, 1, &scissor);
   }
 }
 
 #ifndef VIK_HEADLESS
 void vik_cmd_draw(VikExecutor *executor, VikMesh *mesh, u32 instances_len) {
   VkDeviceSize offset = 0;
-  vkCmdBindVertexBuffers(executor->buffer, 0, 1, &mesh->vertex_buffer, &offset);
-  vkCmdBindIndexBuffer(executor->buffer, mesh->index_buffer, 0, VK_INDEX_TYPE_UINT32);
-  vkCmdDrawIndexed(executor->buffer, mesh->indices_len, instances_len, 0, 0, 0);
+  vkCmdBindVertexBuffers(executor->buffers[executor->instance->frame_index], 0, 1, &mesh->vertex_buffer, &offset);
+  vkCmdBindIndexBuffer(executor->buffers[executor->instance->frame_index], mesh->index_buffer, 0, VK_INDEX_TYPE_UINT32);
+  vkCmdDrawIndexed(executor->buffers[executor->instance->frame_index], mesh->indices_len, instances_len, 0, 0, 0);
 }
 #endif
 
 void vik_cmd_compute(VikExecutor *executor, u32 groups_x, u32 groups_y, u32 groups_z) {
-  vkCmdDispatch(executor->buffer, groups_x, groups_y, groups_z);
+  vkCmdDispatch(executor->buffers[executor->instance->frame_index], groups_x, groups_y, groups_z);
 }
 
 void *vik_get_buffer_data(VikBuffer *buffer) {
@@ -2358,7 +2386,9 @@ void vik_delete_instance(VikInstance *instance) {
 
   vkDestroyCommandPool(instance->device, instance->temp_pool, NULL);
 
-  vkDestroyFence(instance->device, instance->in_flight_fence, NULL);
+  for (u32 i = 0; i < FRAMES_IN_FLIGHT; ++i)
+    vkDestroyFence(instance->device, instance->in_flight_fences[i], NULL);
+#ifndef VIK_HEADLESS
   if (!instance->is_headless) {
     for (u32 i = 0; i < instance->resources.images_len; ++i)
       vkDestroySemaphore(instance->device, instance->render_finished_semaphores[i], NULL);
@@ -2369,19 +2399,20 @@ void vik_delete_instance(VikInstance *instance) {
     free(instance->render_finished_semaphores);
 
     if (instance->has_depth) {
-      vkDestroyImageView(instance->device, instance->resources.depth_image_view, NULL);
-      vkDestroyImage(instance->device, instance->resources.depth_image, NULL);
-      vkFreeMemory(instance->device, instance->resources.depth_image_memory, NULL);
+      for (u32 i = 0; i < FRAMES_IN_FLIGHT; ++i) {
+        vkDestroyImageView(instance->device, instance->resources.depth_image_views[i], NULL);
+        vkDestroyImage(instance->device, instance->resources.depth_images[i], NULL);
+        vkFreeMemory(instance->device, instance->resources.depth_image_memories[i], NULL);
+      }
     }
     for (u32 i = 0; i < instance->resources.images_len; ++i)
       vkDestroyFramebuffer(instance->device, instance->resources.framebuffers[i], NULL);
 
     vkDestroyRenderPass(instance->device, instance->render_pass, NULL);
 
-#ifndef VIK_HEADLESS
     delete_window_size_dependant_resources(&instance->resources, instance->device);
-#endif
   }
+#endif
 
   vkDestroyDevice(instance->device, NULL);
   if (!instance->is_headless)
