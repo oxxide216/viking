@@ -2143,7 +2143,7 @@ bool vik_end_frame(VikExecutor *executor) {
   }
 
   VkSemaphore wait_semaphores[] = {
-    instance->image_available_semaphores[instance->image_index],
+    instance->image_available_semaphores[instance->frame_index],
     instance->compute_finished_semaphore,
   };
   VkPipelineStageFlags wait_stages[] = {
