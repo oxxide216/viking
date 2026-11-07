@@ -41,7 +41,7 @@ struct VikInstance {
   VkQueue                       compute_queue;
   WindowSizeDependantResources  resources;
   VkRenderPass                  render_pass;
-  VkSemaphore                   image_available_semaphore;
+  VkSemaphore                   image_available_semaphores[FRAMES_IN_FLIGHT];
   VkSemaphore                  *render_finished_semaphores;
   VkSemaphore                   compute_finished_semaphore;
   VkFence                       in_flight_fences[FRAMES_IN_FLIGHT];
@@ -726,7 +726,7 @@ VikInstance *vik_make_instance(WinxWindow *window,
   if (!make_framebuffers(&resources, device, render_pass, enable_depth))
     return NULL;
 
-  VkSemaphore image_available_semaphore;
+  VkSemaphore image_available_semaphores[FRAMES_IN_FLIGHT];
   VkSemaphore *render_finished_semaphores = malloc(resources.images_len * sizeof(*render_finished_semaphores));
   VkFence in_flight_fences[FRAMES_IN_FLIGHT];
 
@@ -739,14 +739,14 @@ VikInstance *vik_make_instance(WinxWindow *window,
 
   VkResult sync_result;
 
-  sync_result = vkCreateSemaphore(device, &semaphore_create_info, NULL, &image_available_semaphore);
-  if (sync_result != VK_SUCCESS) {
-    sprintf(error_buffer, "Failed to create Vulkan syncronization primitives: %s",
-            vk_result_to_cstr(sync_result));
-    return NULL;
-  }
-
   for (u32 i = 0; i < FRAMES_IN_FLIGHT; ++i) {
+    sync_result = vkCreateSemaphore(device, &semaphore_create_info, NULL, image_available_semaphores + i);
+    if (sync_result != VK_SUCCESS) {
+      sprintf(error_buffer, "Failed to create Vulkan syncronization primitives: %s",
+              vk_result_to_cstr(sync_result));
+      return NULL;
+    }
+
     sync_result = vkCreateFence(device, &fence_create_info, NULL, in_flight_fences + i);
     if (sync_result != VK_SUCCESS) {
       sprintf(error_buffer, "Failed to create Vulkan syncronization primitives: %s",
@@ -790,7 +790,7 @@ VikInstance *vik_make_instance(WinxWindow *window,
   result->compute_queue = compute_queue;
   result->resources = resources;
   result->render_pass = render_pass;
-  result->image_available_semaphore = image_available_semaphore;
+  memcpy(result->image_available_semaphores, image_available_semaphores, sizeof(image_available_semaphores));
   result->render_finished_semaphores = render_finished_semaphores;
   memcpy(result->in_flight_fences, in_flight_fences, sizeof(in_flight_fences));
   result->temp_pool = command_pool;
@@ -2046,7 +2046,7 @@ bool vik_begin_frame(VikExecutor *executor, f32 r, f32 g, f32 b, f32 a) {
   VkResult acquire_result = vkAcquireNextImageKHR(instance->device,
                                                   instance->resources.swap_chain,
                                                   UINT64_MAX,
-                                                  instance->image_available_semaphore,
+                                                  instance->image_available_semaphores[instance->frame_index],
                                                   VK_NULL_HANDLE, &instance->image_index);
   if (acquire_result == VK_ERROR_OUT_OF_DATE_KHR || acquire_result == VK_SUBOPTIMAL_KHR) {
     vkDeviceWaitIdle(instance->device);
@@ -2143,7 +2143,7 @@ bool vik_end_frame(VikExecutor *executor) {
   }
 
   VkSemaphore wait_semaphores[] = {
-    instance->image_available_semaphore,
+    instance->image_available_semaphores[instance->image_index],
     instance->compute_finished_semaphore,
   };
   VkPipelineStageFlags wait_stages[] = {
@@ -2392,7 +2392,8 @@ void vik_delete_instance(VikInstance *instance) {
   if (!instance->is_headless) {
     for (u32 i = 0; i < instance->resources.images_len; ++i)
       vkDestroySemaphore(instance->device, instance->render_finished_semaphores[i], NULL);
-    vkDestroySemaphore(instance->device, instance->image_available_semaphore, NULL);
+    for (u32 i = 0; i < FRAMES_IN_FLIGHT; ++i)
+      vkDestroySemaphore(instance->device, instance->image_available_semaphores[i], NULL);
     if (instance->has_compute)
       vkDestroySemaphore(instance->device, instance->compute_finished_semaphore, NULL);
 
