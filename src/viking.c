@@ -2489,6 +2489,8 @@ void vik_delete_mesh(VikMesh *mesh) {
 }
 
 void vik_delete_image(VikImage *image) {
+  vkDeviceWaitIdle(image->instance->device);
+
   vkDestroySampler(image->instance->device, image->sampler, NULL);
   vkDestroyImageView(image->instance->device, image->view, NULL);
   vkDestroyImage(image->instance->device, image->image, NULL);
