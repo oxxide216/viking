@@ -2381,6 +2381,36 @@ void vik_use_resources(VikPipeline *pipeline,
                          images, images_len);
 }
 
+void vik_set_viewport(VikExecutor *executor, f32 x, f32 y, f32 w, f32 h) {
+  VkCommandBuffer buffer = executor->buffers[executor->instance->frame_index];
+
+  VkViewport viewport = {0};
+  viewport.x = x;
+  viewport.y = y;
+  viewport.width = w;
+  viewport.height = h;
+  viewport.minDepth = 0.0f;
+  viewport.maxDepth = 1.0f;
+
+  vkCmdSetViewport(buffer, 0, 1, &viewport);
+
+  VkRect2D scissor = {0};
+  scissor.offset = (VkOffset2D) { x, y };
+  scissor.extent = (VkExtent2D) { w, h };
+
+  vkCmdSetScissor(buffer, 0, 1, &scissor);
+}
+
+void vik_set_scissor(VikExecutor *executor, f32 x, f32 y, f32 w, f32 h) {
+  VkCommandBuffer buffer = executor->buffers[executor->instance->frame_index];
+
+  VkRect2D scissor = {0};
+  scissor.offset = (VkOffset2D) { x, y };
+  scissor.extent = (VkExtent2D) { w, h };
+
+  vkCmdSetScissor(buffer, 0, 1, &scissor);
+}
+
 void vik_delete_instance(VikInstance *instance) {
   vkDeviceWaitIdle(instance->device);
 

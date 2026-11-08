@@ -121,6 +121,9 @@ void vik_use_resources(VikPipeline *pipeline,
                        VikBuffer **buffers, u32 buffers_len,
                        VikImage **images, u32 images_len);
 
+void vik_set_viewport(VikExecutor *executor, f32 x, f32 y, f32 w, f32 h);
+void vik_set_scissor(VikExecutor *executor, f32 x, f32 y, f32 w, f32 h);
+
 void vik_delete_instance(VikInstance *instance);
 void vik_delete_shader(VikShader *shader);
 void vik_delete_buffer(VikBuffer *buffer);
