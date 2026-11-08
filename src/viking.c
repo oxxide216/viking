@@ -2127,6 +2127,22 @@ bool vik_begin_frame(VikExecutor *executor, f32 r, f32 g, f32 b, f32 a) {
   vkCmdBeginRenderPass(executor->buffers[instance->frame_index],
                        &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
 
+  VkViewport viewport = {0};
+  viewport.x = 0.0f;
+  viewport.y = 0.0f;
+  viewport.width = instance->resources.extent.width;
+  viewport.height = instance->resources.extent.height;
+  viewport.minDepth = 0.0f;
+  viewport.maxDepth = 1.0f;
+
+  vkCmdSetViewport(executor->buffers[instance->frame_index], 0, 1, &viewport);
+
+  VkRect2D scissor = {0};
+  scissor.offset = (VkOffset2D) { 0, 0 };
+  scissor.extent = instance->resources.extent;
+
+  vkCmdSetScissor(executor->buffers[instance->frame_index], 0, 1, &scissor);
+
   return true;
 }
 
@@ -2300,24 +2316,6 @@ void vik_cmd_use_pipeline(VikExecutor *executor, VikPipeline *pipeline) {
   vkCmdBindPipeline(buffer, bind_point, pipeline->pipeline);
   if (pipeline->descriptor_set != VK_NULL_HANDLE)
     vkCmdBindDescriptorSets(buffer, bind_point, pipeline->layout, 0, 1, &pipeline->descriptor_set, 0, NULL);
-
-  if (!pipeline->is_compute) {
-    VkViewport viewport = {0};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width = instance->resources.extent.width;
-    viewport.height = instance->resources.extent.height;
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-
-    vkCmdSetViewport(buffer, 0, 1, &viewport);
-
-    VkRect2D scissor = {0};
-    scissor.offset = (VkOffset2D) { 0, 0 };
-    scissor.extent = instance->resources.extent;
-
-    vkCmdSetScissor(buffer, 0, 1, &scissor);
-  }
 }
 
 #ifndef VIK_HEADLESS
