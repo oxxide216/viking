@@ -23,7 +23,21 @@ typedef struct {
   VkFramebuffer      *framebuffers;
 } WindowSizeDependantResources;
 
+typedef Da(VikShader *) VikShaders;
+typedef Da(VikBuffer *) VikBuffers;
 typedef Da(VikPipeline *) VikPipelines;
+typedef Da(VikExecutor *) VikExecutors;
+typedef Da(VikMesh *) VikMeshes;
+typedef Da(VikImage *) VikImages;
+
+typedef struct {
+  VikBuffer **buffers;
+  u32         buffers_len;
+  VikImage **images;
+  u32        images_len;
+} BuffersAndImages;
+
+typedef Da(BuffersAndImages) BuffersAndImagesPairs;
 
 // TODO: separate swapchain and surface from instance
 struct VikInstance {
@@ -52,6 +66,14 @@ struct VikInstance {
   bool                          was_compute_used_in_this_frame;
   bool                          has_depth;
   bool                          is_headless;
+  VikShaders                    shaders_to_delete;
+  VikBuffers                    buffers_to_delete;
+  VikPipelines                  pipelines_to_delete;
+  VikExecutors                  executors_to_delete;
+  VikMeshes                     meshes_to_delete;
+  VikImages                     images_to_delete;
+  VikPipelines                  pipelines_to_update_resources;
+  BuffersAndImagesPairs         pairs;
 };
 
 typedef enum {
@@ -1514,7 +1536,7 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
   VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
   if (has_descriptor_set_layout) {
     VkDescriptorSetLayoutBinding *layout_bindings =
-      malloc((buffers_len + images_len) * sizeof(*layout_bindings));
+      alloca((buffers_len + images_len) * sizeof(*layout_bindings));
     memset(layout_bindings, 0, (buffers_len + images_len) * sizeof(*layout_bindings));
 
     for (u32 i = 0; i < buffers_len; ++i) {
@@ -1541,11 +1563,8 @@ VikPipeline *vik_make_pipeline(VikInstance *instance, VikShader *shader,
     if (descriptor_set_layout_result != VK_SUCCESS) {
       sprintf(error_buffer, "Failed to create Vulkan descriptor set layout: %s",
               vk_result_to_cstr(descriptor_set_layout_result));
-      free(layout_bindings);
       return NULL;
     }
-
-    free(layout_bindings);
 
     VkDescriptorSetAllocateInfo descriptor_set_alloc_info = {0};
     descriptor_set_alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -2035,6 +2054,109 @@ VikImage *vik_make_image_ex(VikInstance *instance, void *data,
   return result;
 }
 
+static void flush_things_to_delete(VikInstance *instance) {
+  vkDeviceWaitIdle(instance->device);
+
+  for (u32 i = 0; i < instance->shaders_to_delete.len; ++i) {
+    VikShader *shader = instance->shaders_to_delete.items[i];
+
+    switch (shader->kind) {
+    case VikShaderKindVF: {
+      vkDestroyShaderModule(instance->device, shader->vertex_module, NULL);
+      vkDestroyShaderModule(instance->device, shader->fragment_module, NULL);
+    } break;
+
+    case VikShaderKindVGF: {
+      vkDestroyShaderModule(instance->device, shader->vertex_module, NULL);
+      vkDestroyShaderModule(instance->device, shader->geometry_module, NULL);
+      vkDestroyShaderModule(instance->device, shader->fragment_module, NULL);
+    } break;
+
+    case VikShaderKindC: {
+      vkDestroyShaderModule(instance->device, shader->compute_module, NULL);
+    } break;
+    }
+
+    free(shader);
+  }
+  instance->shaders_to_delete.len = 0;
+
+  for (u32 i = 0; i < instance->buffers_to_delete.len; ++i) {
+    VikBuffer *buffer = instance->buffers_to_delete.items[i];
+
+    vkDestroyBuffer(instance->device, buffer->buffer, NULL);
+    vkFreeMemory(instance->device, buffer->buffer_memory, NULL);
+
+    free(buffer);
+  }
+  instance->buffers_to_delete.len = 0;
+
+  for (u32 i = 0; i < instance->pipelines_to_delete.len; ++i) {
+    VikPipeline *pipeline = instance->pipelines_to_delete.items[i];
+
+    vkDestroyPipeline(instance->device, pipeline->pipeline, NULL);
+    vkDestroyPipelineLayout(instance->device, pipeline->layout, NULL);
+    if (pipeline->has_descriptor_set_layout)
+      vkDestroyDescriptorSetLayout(instance->device, pipeline->descriptor_set_layout, NULL);
+    vkDestroyDescriptorPool(instance->device, pipeline->descriptor_pool, NULL);
+
+    free(pipeline);
+  }
+  instance->pipelines_to_delete.len = 0;
+
+  for (u32 i = 0; i < instance->executors_to_delete.len; ++i) {
+    VikExecutor *executor = instance->executors_to_delete.items[i];
+
+    vkDestroyCommandPool(instance->device, executor->pool, NULL);
+
+    free(executor);
+  }
+  instance->executors_to_delete.len = 0;
+
+  for (u32 i = 0; i < instance->meshes_to_delete.len; ++i) {
+    VikMesh *mesh = instance->meshes_to_delete.items[i];
+
+    vkDestroyBuffer(instance->device, mesh->vertex_buffer, NULL);
+    vkFreeMemory(instance->device, mesh->vertex_buffer_memory, NULL);
+    vkDestroyBuffer(instance->device, mesh->index_buffer, NULL);
+    vkFreeMemory(instance->device, mesh->index_buffer_memory, NULL);
+
+    free(mesh);
+  }
+  instance->meshes_to_delete.len = 0;
+
+  for (u32 i = 0; i < instance->images_to_delete.len; ++i) {
+    VikImage *image = instance->images_to_delete.items[i];
+
+    vkDestroySampler(instance->device, image->sampler, NULL);
+    vkDestroyImageView(instance->device, image->view, NULL);
+    vkDestroyImage(instance->device, image->image, NULL);
+    vkFreeMemory(instance->device, image->memory, NULL);
+
+    free(image);
+  }
+  instance->images_to_delete.len = 0;
+}
+
+static void flush_pipelines_to_update_resources(VikInstance *instance) {
+ for (u32 i = 0; i < instance->pipelines_to_update_resources.len; ++i) {
+    VikPipeline *pipeline = instance->pipelines_to_update_resources.items[i];
+    BuffersAndImages *pair = instance->pairs.items + i;
+
+    pipeline_use_resources(instance->device,
+                           pipeline->descriptor_set,
+                           pair->buffers, pair->buffers_len,
+                           pair->images, pair->images_len);
+
+    if (pair->buffers)
+      free(pair->buffers);
+    if (pair->images)
+      free(pair->images);
+  }
+  instance->pipelines_to_update_resources.len = 0;
+  instance->pairs.len = 0;
+}
+
 #ifndef VIK_HEADLESS
 bool vik_begin_frame(VikExecutor *executor, f32 r, f32 g, f32 b, f32 a) {
   VikInstance *instance = executor->instance;
@@ -2042,6 +2164,9 @@ bool vik_begin_frame(VikExecutor *executor, f32 r, f32 g, f32 b, f32 a) {
   vkWaitForFences(instance->device, 1,
                   instance->in_flight_fences + instance->frame_index,
                   VK_TRUE, UINT64_MAX);
+
+  flush_pipelines_to_update_resources(instance);
+  flush_things_to_delete(instance);
 
   VkResult acquire_result = vkAcquireNextImageKHR(instance->device,
                                                   instance->resources.swap_chain,
@@ -2373,10 +2498,16 @@ void vik_set_buffer_data(VikBuffer *buffer, void *data) {
 void vik_use_resources(VikPipeline *pipeline,
                        VikBuffer **buffers, u32 buffers_len,
                        VikImage **images, u32 images_len) {
-  pipeline_use_resources(pipeline->instance->device,
-                         pipeline->descriptor_set,
-                         buffers, buffers_len,
-                         images, images_len);
+  DA_APPEND(pipeline->instance->pipelines_to_update_resources, pipeline);
+
+  BuffersAndImages pair;
+  pair.buffers_len = buffers_len;
+  pair.buffers = malloc(pair.buffers_len * sizeof(*pair.buffers));
+  memcpy(pair.buffers, buffers, pair.buffers_len * sizeof(*pair.buffers));
+  pair.images_len = images_len;
+  pair.images = malloc(pair.images_len * sizeof(*pair.images));
+  memcpy(pair.images, images, pair.images_len * sizeof(*pair.images));
+  DA_APPEND(pipeline->instance->pairs, pair);
 }
 
 void vik_set_viewport(VikExecutor *executor, f32 x, f32 y, f32 w, f32 h) {
@@ -2410,7 +2541,26 @@ void vik_set_scissor(VikExecutor *executor, f32 x, f32 y, f32 w, f32 h) {
 }
 
 void vik_delete_instance(VikInstance *instance) {
-  vkDeviceWaitIdle(instance->device);
+  flush_pipelines_to_update_resources(instance);
+  flush_things_to_delete(instance);
+
+  if (instance->shaders_to_delete.items)
+    free(instance->shaders_to_delete.items);
+  if (instance->buffers_to_delete.items)
+    free(instance->buffers_to_delete.items);
+  if (instance->pipelines_to_delete.items)
+    free(instance->pipelines_to_delete.items);
+  if (instance->executors_to_delete.items)
+    free(instance->executors_to_delete.items);
+  if (instance->meshes_to_delete.items)
+    free(instance->meshes_to_delete.items);
+  if (instance->images_to_delete.items)
+    free(instance->images_to_delete.items);
+
+  if (instance->pipelines_to_update_resources.items)
+    free(instance->pipelines_to_update_resources.items);
+  if (instance->pairs.items)
+    free(instance->pairs.items);
 
   vkDestroyCommandPool(instance->device, instance->temp_pool, NULL);
 
@@ -2455,77 +2605,27 @@ void vik_delete_instance(VikInstance *instance) {
 }
 
 void vik_delete_shader(VikShader *shader) {
-  vkDeviceWaitIdle(shader->instance->device);
-
-  switch (shader->kind) {
-  case VikShaderKindVF: {
-    vkDestroyShaderModule(shader->instance->device, shader->vertex_module, NULL);
-    vkDestroyShaderModule(shader->instance->device, shader->fragment_module, NULL);
-  } break;
-
-  case VikShaderKindVGF: {
-    vkDestroyShaderModule(shader->instance->device, shader->vertex_module, NULL);
-    vkDestroyShaderModule(shader->instance->device, shader->geometry_module, NULL);
-    vkDestroyShaderModule(shader->instance->device, shader->fragment_module, NULL);
-  } break;
-
-  case VikShaderKindC: {
-    vkDestroyShaderModule(shader->instance->device, shader->compute_module, NULL);
-  } break;
-  }
-
-  free(shader);
+  DA_APPEND(shader->instance->shaders_to_delete, shader);
 }
 
 void vik_delete_buffer(VikBuffer *buffer) {
-  vkDeviceWaitIdle(buffer->instance->device);
-
-  vkDestroyBuffer(buffer->instance->device, buffer->buffer, NULL);
-  vkFreeMemory(buffer->instance->device, buffer->buffer_memory, NULL);
-
-  free(buffer);
+  DA_APPEND(buffer->instance->buffers_to_delete, buffer);
 }
 
 void vik_delete_pipeline(VikPipeline *pipeline) {
-  vkDeviceWaitIdle(pipeline->instance->device);
-
-  vkDestroyPipeline(pipeline->instance->device, pipeline->pipeline, NULL);
-  vkDestroyPipelineLayout(pipeline->instance->device, pipeline->layout, NULL);
-  if (pipeline->has_descriptor_set_layout)
-    vkDestroyDescriptorSetLayout(pipeline->instance->device, pipeline->descriptor_set_layout, NULL);
-  vkDestroyDescriptorPool(pipeline->instance->device, pipeline->descriptor_pool, NULL);
-
-  free(pipeline);
+  DA_APPEND(pipeline->instance->pipelines_to_delete, pipeline);
 }
 
 void vik_delete_executor(VikExecutor *executor) {
-  vkDeviceWaitIdle(executor->instance->device);
-
-  vkDestroyCommandPool(executor->instance->device, executor->pool, NULL);
-
-  free(executor);
+  DA_APPEND(executor->instance->executors_to_delete, executor);
 }
 
 void vik_delete_mesh(VikMesh *mesh) {
-  vkDeviceWaitIdle(mesh->instance->device);
-
-  vkDestroyBuffer(mesh->instance->device, mesh->vertex_buffer, NULL);
-  vkFreeMemory(mesh->instance->device, mesh->vertex_buffer_memory, NULL);
-  vkDestroyBuffer(mesh->instance->device, mesh->index_buffer, NULL);
-  vkFreeMemory(mesh->instance->device, mesh->index_buffer_memory, NULL);
-
-  free(mesh);
+  DA_APPEND(mesh->instance->meshes_to_delete, mesh);
 }
 
 void vik_delete_image(VikImage *image) {
-  vkDeviceWaitIdle(image->instance->device);
-
-  vkDestroySampler(image->instance->device, image->sampler, NULL);
-  vkDestroyImageView(image->instance->device, image->view, NULL);
-  vkDestroyImage(image->instance->device, image->image, NULL);
-  vkFreeMemory(image->instance->device, image->memory, NULL);
-
-  free(image);
+  DA_APPEND(image->instance->images_to_delete, image);
 }
 
 const char *vik_get_error_str(void) {
